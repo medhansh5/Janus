@@ -1,0 +1,28 @@
+# Rust target directories
+/target/
+/bootloader/target/
+/kernel/target/
+
+# Build artifacts
+*.efi
+*.img
+*.iso
+*.elf
+esp/
+
+# Logs
+*.log
+/qemu.log
+
+# OVMF generated variable files
+OVMF_VARS.fd
+nvram.fd
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store

@@ -1,0 +1,226 @@
+use crate::capability::CPtr;
+use x86_64::PhysAddr;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Runnable,
+    /// Blocked waiting to receive a message on the specified endpoint capability
+    BlockedOnRecv { endpoint: CPtr },
+    /// Blocked waiting to send a message on the specified endpoint capability
+    BlockedOnSend { endpoint: CPtr },
+    /// Terminated by the kernel due to a fault or security violation
+    Terminated,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Default)]
+pub struct TaskContext {
+    // Callee-saved registers for context switching
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub rbx: u64,
+    pub rbp: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    // The stack pointer (either kernel stack or user stack, depending on state)
+    pub rsp: u64,
+    // The instruction pointer (return address)
+    pub rip: u64,
+}
+
+impl TaskContext {
+    pub const fn empty() -> Self {
+        TaskContext {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbx: 0,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            rsp: 0,
+            rip: 0,
+        }
+    }
+}
+
+pub struct Task {
+    pub id: u64,
+    pub page_table: PhysAddr,
+    pub root_cnode: CPtr,
+    pub context: TaskContext,
+    pub state: TaskState,
+    pub kernel_stack_top: u64, // Used to set RSP0 in TSS on switch
+    pub ipc_message: u64,      // Dedicated slot for synchronous IPC messages
+}
+
+impl Task {
+    pub fn new(id: u64, page_table: PhysAddr, root_cnode: CPtr, kernel_stack_top: u64) -> Self {
+        Self {
+            id,
+            page_table,
+            root_cnode,
+            context: TaskContext::default(),
+            state: TaskState::Runnable,
+            kernel_stack_top,
+            ipc_message: 0,
+        }
+    }
+}
+
+// Global task list (for v0, we can just use a simple static array)
+pub const MAX_TASKS: usize = 16;
+static mut TASKS: [Option<Task>; MAX_TASKS] = [
+    None, None, None, None, None, None, None, None,
+    None, None, None, None, None, None, None, None,
+];
+static mut CURRENT_TASK_ID: Option<u64> = None;
+
+pub fn current_task_id() -> Option<u64> {
+    unsafe { CURRENT_TASK_ID }
+}
+
+pub unsafe fn register_task(task: Task) {
+    let id = task.id as usize;
+    if id < MAX_TASKS {
+        TASKS[id] = Some(task);
+    }
+}
+
+pub unsafe fn get_task_mut<'a>(id: u64) -> Option<&'a mut Task> {
+    if id < MAX_TASKS as u64 {
+        TASKS[id as usize].as_mut()
+    } else {
+        None
+    }
+}
+
+pub unsafe fn current_task_mut<'a>() -> Option<&'a mut Task> {
+    if let Some(id) = CURRENT_TASK_ID {
+        get_task_mut(id)
+    } else {
+        None
+    }
+}
+
+pub unsafe fn schedule() {
+    let current_id = CURRENT_TASK_ID.unwrap();
+    let mut next_id = current_id + 1;
+    
+    // Find the next runnable task
+    loop {
+        if next_id >= MAX_TASKS as u64 {
+            next_id = 0;
+        }
+        if let Some(ref t) = TASKS[next_id as usize] {
+            if t.state == TaskState::Runnable {
+                break;
+            }
+        }
+        if next_id == current_id {
+            // No other runnable tasks! (In a real OS, idle task would run)
+            return;
+        }
+        next_id += 1;
+    }
+    
+    // Perform context switch
+    let prev = get_task_mut(current_id).unwrap();
+    let next = get_task_mut(next_id).unwrap();
+    
+    CURRENT_TASK_ID = Some(next_id);
+    
+    // Update TSS RSP0 to the new task's kernel stack (for interrupts)
+    crate::gdt::set_kernel_stack(next.kernel_stack_top);
+    
+    // Also update the scratch variable for `syscall`
+    unsafe {
+        crate::syscall::KERNEL_RSP_SCRATCH = next.kernel_stack_top;
+    }
+    
+    // Switch CR3 to the new task's page table
+    let cr3_val = next.page_table.as_u64() | 0x3; // PRESENT | WRITABLE? Actually CR3 doesn't need these flags, but some do. Just phys addr is fine.
+    core::arch::asm!(
+        "mov cr3, {0}",
+        in(reg) next.page_table.as_u64(),
+        options(nostack)
+    );
+
+    switch_context(&mut prev.context, &next.context);
+}
+
+pub unsafe fn set_current_task(id: u64) {
+    CURRENT_TASK_ID = Some(id);
+}
+
+/// The context switch assembly routine.
+/// Defined in naked assembly to preserve registers perfectly.
+core::arch::global_asm!(
+    ".global switch_context",
+    "switch_context:",
+    // rdi = *mut TaskContext (prev)
+    // rsi = *const TaskContext (next)
+    
+    // Save current context into `prev`
+    "mov [rdi + 0x00], r15",
+    "mov [rdi + 0x08], r14",
+    "mov [rdi + 0x10], r13",
+    "mov [rdi + 0x18], r12",
+    "mov [rdi + 0x20], rbx",
+    "mov [rdi + 0x28], rbp",
+    "mov [rdi + 0x30], rsi",
+    "mov [rdi + 0x38], rdi", 
+    "mov [rdi + 0x40], rsp",  // Save RSP (points to return address from `call switch_context`)
+    // rip is saved implicitly: [rsp] holds the return address. We don't need to save it
+    // separately because we'll use `ret` to return to it.
+    
+    // Restore context from `next`
+    "mov r15, [rsi + 0x00]",
+    "mov r14, [rsi + 0x08]",
+    "mov r13, [rsi + 0x10]",
+    "mov r12, [rsi + 0x18]",
+    "mov rbx, [rsi + 0x20]",
+    "mov rbp, [rsi + 0x28]",
+    "mov rdi, [rsi + 0x38]",
+    "mov rsp, [rsi + 0x40]", // Restore RSP (points to saved return address)
+    "mov rsi, [rsi + 0x30]", // Restore next.rsi (do this last since rsi was used as the pointer)
+    
+    // `ret` pops [rsp] and jumps to it — the return address from the original
+    // `call switch_context` in yield_cpu(). This properly unwinds the call frame.
+    "ret"
+);
+
+core::arch::global_asm!(
+    ".global jump_to_user",
+    "jump_to_user:",
+    // rdi = user_rip
+    // rsi = user_rsp
+    
+    // Disable interrupts before setting up state to avoid getting interrupted mid-transition
+    "cli",
+    
+    // iretq requires a 5-word frame on the stack:
+    // SS, RSP, RFLAGS, CS, RIP
+    
+    // Push SS (User Data = 0x1B)
+    "push 0x1B",
+    // Push User RSP
+    "push rsi",
+    // Push RFLAGS (IF bit SET = 0x202, so interrupts are ENABLED in user space)
+    "push 0x202",
+    // Push CS (User Code = 0x23)
+    "push 0x23",
+    // Push User RIP
+    "push rdi",
+    
+    // Switch to user stack is handled by iretq popping RSP
+    "iretq"
+);
+
+extern "C" {
+    pub fn switch_context(prev: *mut TaskContext, next: *const TaskContext);
+    pub fn jump_to_user(user_rip: u64, user_rsp: u64) -> !;
+}
