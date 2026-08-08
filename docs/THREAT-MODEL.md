@@ -41,7 +41,6 @@ The following threats are acknowledged but deferred to later iterations of Janus
 
 ### 2.3 Denial of Service (DoS) and Resource Starvation
 - As the kernel introduces a preemptive scheduler, resource-starvation attacks (e.g., a malicious task intentionally exhausting its timeslice or flooding IPC channels) become possible. Fine-grained resource quotas, CPU time accounting, and real-time scheduling guarantees are not implemented in v1. Until these defenses are built, local DoS remains an accepted risk.
-- **Known Gap**: Currently, if the system reaches zero `Runnable` tasks (e.g., all tasks block or terminate), the scheduler lacks an explicit Idle Task or power-state halt loop, which could lead to undefined behavior or infinite loops of dead tasks. An explicit Idle Task will be required for v1+.
 
 ### 2.4 Multi-Core Support and APIC Migration (Deferred to v1+)
 - For the v0 milestone, the kernel targets a uniprocessor environment and uses the legacy 8259 PIC for timer interrupts. The PIC is insufficient for multi-core scaling (as it lacks Inter-Processor Interrupt (IPI) support). Multi-core support is deferred to v1+, which will require migrating the interrupt subsystem to the Advanced Programmable Interrupt Controller (APIC) and implementing concurrent capability management.
@@ -58,9 +57,11 @@ The following threats are acknowledged but deferred to later iterations of Janus
 ### 2.5 Audit & Provenance (Deferred to v1 GA)
 - Capability grant/revoke logging is deferred. While not present in v0, this is acknowledged as a hard requirement for forensic analysis and system auditing, and will be designed and implemented before v1 GA.
 
-## 3. Summary of Trust
+## 3. Component Trust Levels
 
-- **Trusted**: The Rust compiler, the Kernel, the Bootloader (and its signing key).
-- **Highly Trusted**: The `init` service, which manages capability distribution.
-- **Untrusted**: All network traffic, all third-party WASM apps, all file formats (parsed by isolated services).
-- **Supply-Chain Risk**: We acknowledge the dependency supply-chain risk introduced by third-party packages (crates.io). To mitigate this, Janus commits to using minimal dependencies in kernel/service code, utilizing pinned lockfiles, and running periodic `cargo-audit` checks.
+1. **Kernel (TCB)**: Highly Trusted. Responsible only for IPC routing, context switching, capability validation, and memory isolation.
+2. **Init Task**: Highly Trusted. The first userspace task is responsible for allocating initial capabilities (parsing `INIT-POLICY.md`) and spawning service tasks.
+3. **Drivers (e.g., virtio-blk)**: Untrusted. Hardware drivers run entirely in Ring 3 userspace. They cannot arbitrarily access PCI space or system memory. The kernel discovers PCI devices and mints strictly scoped `IOPort` (for the device's BARs), `Frame` (for DMA), and `InterruptEndpoint` capabilities to the driver. If a driver crashes or goes rogue, it can only affect its assigned device and clients; it cannot breach kernel memory or other devices.
+4. **WASM Runtime / Web Applications**: Untrusted. Will run sandboxed within isolated userspace tasks.
+5. **System Services**: Moderately Trusted. VFS or Network stack run as isolated tasks and must be robust against malicious inputs from unprivileged tasks, but their internal compromise doesn't necessarily breach the kernel.
+6. **Supply-Chain Risk**: We acknowledge the dependency supply-chain risk introduced by third-party packages (crates.io). To mitigate this, Janus commits to using minimal dependencies in kernel/service code, utilizing pinned lockfiles, and running periodic `cargo-audit` checks.

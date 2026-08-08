@@ -33,10 +33,30 @@ With the timer ticking and interrupts enabled in userspace (`IF=1`), Janus is no
 - The timer handler preempts the user task, switches the kernel stack (`KERNEL_RSP_SCRATCH` and TSS `RSP0`), and round-robins to the next `Runnable` task.
 - Our 50-iteration IPC stress test successfully runs concurrently with timer ticks, and eventually triggers the capability security fault as intended.
 
-> [!NOTE]
-> **Known Gap for v1**: Currently, `schedule()` does not implement an "idle loop" or handle the scenario where the system reaches zero `Runnable` tasks (e.g. if the last running task terminates). For v0, the payload loops infinitely by design. For v1+, an explicitly designated kernel Idle Task or power-state halt (`hlt` in a loop) will be required to handle total system starvation/blocking.
+## 5. V1 Initialization: Idle Task & Init Policy
 
-## 5. Security & Cleanup
+With v0 complete, we began laying the groundwork for v1.
+
+- **Idle Task Mechanism**: We identified a scheduler flaw where the absence of `Runnable` tasks led to undefined behavior (resuming stale state). We implemented a dedicated Ring 0 Idle Task. If `schedule()` finds no `Runnable` userspace tasks, it falls back to this Idle Task, which simply executes `hlt` to save power. We verified this by having both test tasks terminate intentionally (via an invalid capability fault) and observing the continuous `[KERNEL TIMER] tick N, preempting Idle Task` log.
+- **Init Policy Design**: We drafted `docs/INIT-POLICY.md` to design how the Highly Trusted `init` process will distribute capabilities. We settled on a **Static Manifest** approach (e.g., a simple binary or text file parsed by `init` at boot) to ensure deterministic, auditable capability grants while avoiding the complexity of a dynamic policy engine. The parser for this manifest formally enters our Trusted Computing Base (TCB).
+
+## 6. Validated Capabilities
+*   **V0 (Core)**:
+    *   **Memory Enforcement:** Tasks can only access memory mapped into their specific PML4.
+    *   **Capability Checks:** IPC endpoints (`sys_send`, `sys_recv`) validate CPtr ownership before executing.
+    *   **Preemptive Scheduling:** Hardware timer IRQ interrupts executing tasks reliably, and context is correctly restored.
+*   **V1 (Drivers & Hardware)**:
+    *   **Device Discovery:** Kernel securely probes PCI space and grants isolated `IOPort` capabilities.
+    *   **Interrupt Endpoints:** `InterruptEndpoint` capability maps hardware IRQs directly to user tasks waiting on `sys_recv`.
+    *   **Physical DMA Mappings:** `sys_cap_info` rigorously validates `Frame` capabilities before leaking physical addresses to userspace for DMA.
+    *   **Virtio-Blk Proof of Concept:** A completely untrusted userspace task negotiated Virtio-Blk, formatted descriptors for Sector 0, submitted a physical memory pointer, and received a hardware IRQ upon completion — all without special-cased kernel driver code.
+
+## Known Gaps (for future milestones)
+*   **Idle Behavior**: Fixed in v1: A dedicated kernel-mode Idle Task loop prevents stale context resumption.
+*   **Capabilities**: No delegation/minting/revocation primitives yet.
+*   **Memory**: No unmap or free. Memory is bump-allocated and permanent once assigned.
+
+## 7. Security & Cleanup
 
 - **THREAT-MODEL**: Updated to document the known risks of DoS via resource starvation, and explicitly deferred multi-core (APIC) migration to v1+.
 - **GDT Initialization**: Resolved static mutation warnings in the GDT setup by switching to `spin::Once`.

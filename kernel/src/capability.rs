@@ -26,14 +26,27 @@ pub enum Capability {
         paddr: u64,
         size: u64,
     },
-    /// (Placeholder) An IPC Endpoint capability for synchronous messaging.
+    /// An Endpoint capability for synchronous messaging.
     Endpoint {
         target_task_id: u64,
     },
-    /// (Placeholder) A capability granting access to another CNode.
+    /// A capability granting access to another CNode.
     CNode {
         paddr: u64,
         size: u64,
+    },
+    /// A capability granting access to a physical page of memory.
+    Frame {
+        paddr: u64,
+    },
+    /// A capability granting access to a specific range of I/O ports.
+    IOPort {
+        base: u16,
+        size: u16,
+    },
+    /// A capability to wait for a hardware IRQ.
+    InterruptEndpoint {
+        irq: u8,
     }
 }
 

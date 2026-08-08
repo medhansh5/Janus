@@ -28,10 +28,20 @@ Janus relies on a verified boot chain to establish a root of trust before the ke
 ## 2. Capability Model
 
 Janus uses a strict **kernel-managed capability model** inspired by seL4.
-- **No Ambient Authority**: Applications receive exactly zero privileges by default. They cannot open files, access the network, or map memory without explicit capabilities granted at spawn.
-- **Kernel Enforced**: Capabilities are never stored in userspace memory. They are managed internally by the kernel in a capability node (CNode) tree.
-- **Capability Pointers (CPtr)**: Userspace applications refer to capabilities via an opaque index (`CPtr`). 
-- **Operations**: The kernel acts as the sole authority to `Mint` (create), `Derive` (reduce privileges of an existing capability), `Grant` (send via IPC), and `Revoke` capabilities.
+- **No Ambient Authority**: Janus leverages hardware-enforced capabilities for all resource access. Instead of the kernel implicitly authorizing actions based on user IDs, tasks must explicitly invoke a capability slot in their CNode.
+
+- **Endpoint**: Enables synchronous, unbuffered IPC between two specific tasks.
+- **Untyped**: Represents raw, unallocated physical memory. It can be minted into typed memory (like CNode or Frame) or further split.
+- **CNode**: Represents a capability table, mapping slots to other capabilities.
+- **Frame**: Represents a typed 4KB page of physical memory that can be mapped into a task's address space for data or DMA.
+- **IOPort**: (x86 specific) Grants access to a specific range of I/O ports. Crucial for hardware driver isolation (e.g., scoping PCI access strictly to a device's Base Address Registers).
+- **InterruptEndpoint**: A specialized endpoint that hardware IRQs signal. A driver task waits on this endpoint via `sys_recv`, and the kernel wakes the task when the corresponding hardware interrupt fires.
+
+## Capability Usage
+
+1. **Memory Isolation**: To allocate memory, a task must possess an `Untyped` capability, invoke it to mint a `Frame`, and then instruct the kernel to map that `Frame` into its address space.
+2. **Device Drivers**: Drivers run strictly in unprivileged Ring 3 userspace. The kernel (or highly trusted `init` task) enumerates the PCI bus, discovers devices, and grants the driver task `IOPort` capabilities scoped exclusively to the device's BARs, `Frame` capabilities for DMA buffers, and an `InterruptEndpoint` for device IRQs.
+3. **IPC**: To communicate, tasks must be explicitly granted an `Endpoint` capability pointing to each other.
 
 ### Revocation Semantics
 Capability revocation in Janus is instantaneous and cascading.
@@ -42,8 +52,6 @@ Capability revocation in Janus is instantaneous and cascading.
 ## 3. IPC Design
 
 Inter-Process Communication is the sole method for isolated services to interact.
-- **Preemptive Scheduling**: Janus implements a preemptive scheduler driven by hardware timer interrupts (IRQ0). Task context switching happens cleanly mid-execution in userspace.
-- **Context Switching**: The kernel uses `iretq` instead of `sysretq` for all Ring 3 transitions. This unifies hardware interrupts and software syscalls into a single context-switch path, ensuring atomicity and avoiding the non-canonical return address vulnerabilities associated with `sysretq`.
 - **Synchronous IPC**: Used for blocking RPC-style calls. The scheduler performs a direct thread handoff from the sender to the receiver, minimizing context switch overhead.
 - **Capability Passing**: IPC messages can contain capability pointers (`CPtr`), allowing one process to explicitly grant authority to another process dynamically.
 - **Endpoints**: Processes communicate over unforgeable "Endpoint" capabilities. A process can only send a message to a service if it holds a valid Endpoint capability pointing to that service.

@@ -2,23 +2,26 @@
 
 Janus is a security-first microkernel operating system built around kernel-enforced capabilities and (planned) sandboxed WebAssembly applications. Designed from the ground up in Rust, it strictly adheres to the principle of least privilege: there is zero ambient authority, and every action requires explicit, unforgeable capabilities managed entirely by the kernel.
 
-## Current Status: v0 Milestone Complete
+## Current Status: v1 Milestone Complete
 
-Janus has successfully completed its v0 "proof-of-concept" milestone. The following core features are implemented and validated:
-- **Verified Boot**: The custom UEFI bootloader cryptographically verifies the kernel signature before handoff.
-- **Capability-Enforced Memory Allocation**: The physical frame allocator respects reserved bootloader regions and vends memory via strict capability typing.
+Janus has successfully completed its v1 milestone, proving that real hardware drivers can run safely as unprivileged userspace tasks. The following core features are implemented and validated:
+- **Userspace Drivers (Virtio-Blk)**: The first hardware driver runs entirely in Ring 3, communicating with the kernel via capabilities, proving the microkernel boundary.
+- **Hardware Interrupt Delivery**: Device IRQs are routed securely to userspace tasks via the `InterruptEndpoint` capability.
+- **Contiguous DMA Allocator**: The kernel can securely provision contiguous physical memory frames for hardware DMA buffers.
+- **Scoped PCI Isolation**: `IOPort` capabilities are explicitly scoped so drivers can only touch their own device's Base Address Registers.
+- **Idle Task Mechanism**: A dedicated Ring 0 idle task cleanly handles empty runqueues.
+- **Capability-Enforced Memory**: The physical frame allocator respects reserved bootloader regions and vends memory via strict capability typing.
 - **Preemptive Scheduling**: A hardware timer (IRQ0)-driven scheduler that preempts execution seamlessly in userspace.
-- **Unified Context Switching**: `iretq`-based transitions cleanly unify hardware interrupts and software syscalls.
 - **Synchronous IPC**: Fast, blocking Inter-Process Communication with capability passing.
-- **Security Boundary Proven**: The capability enforcement holds up under stress-testing and arbitrary preemption. Unauthorized operations (e.g., a process attempting to use an invalid Endpoint capability) correctly trigger a kernel-level security fault and terminate the offending task.
+- **Security Boundary Proven**: The capability enforcement holds up under stress-testing and arbitrary preemption. Unauthorized operations (e.g., a process attempting to use an invalid Endpoint capability or unowned physical Frame) correctly trigger a kernel-level security fault and terminate the offending task.
 
 ### What is *NOT* in Janus (Yet)
-To set expectations clearly, Janus is still in its infancy. As of v0, there are:
-- **No hardware drivers** (beyond the serial port for debug logs)
+To set expectations clearly, Janus is still in its infancy. As of v1, there are:
 - **No filesystem** (VFS)
 - **No WASM runtime integration** (test tasks are written in raw assembly)
+- **No independent driver restartability** (a crashed driver terminates securely, but the system doesn't yet automatically recover it)
 - **No UI or shell**
-- **Single-core support only** (multi-core APIC migration deferred to v1)
+- **Single-core support only** (multi-core APIC migration deferred to future milestones)
 
 ## Architecture Overview
 
@@ -27,6 +30,7 @@ Janus relies on a strict microkernel architecture inspired by seL4. The kernel h
 For a deep dive into the design and threat model, see:
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - [THREAT-MODEL.md](docs/THREAT-MODEL.md)
+- [INIT-POLICY.md](docs/INIT-POLICY.md)
 - [Development Walkthrough](docs/walkthrough.md) (a great read on the debugging history!)
 
 ## Build & Run Instructions

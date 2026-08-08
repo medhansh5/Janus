@@ -50,6 +50,10 @@ extern "C" {
     fn general_protection_fault_stub();
     fn page_fault_stub();
     fn timer_stub();
+    fn irq10_stub();
+    fn irq11_stub();
+    fn irq14_stub();
+    fn irq15_stub();
 }
 
 pub fn init() {
@@ -59,7 +63,13 @@ pub fn init() {
         IDT[14].set_handler_fn(page_fault_stub as u64); // #PF
         
         // We will add the Timer handler here later (Vector 32)
-        IDT[32].set_handler_fn(timer_stub as u64); // IRQ0 (Timer)
+        IDT[32].set_handler_fn(timer_stub as *const () as u64); // IRQ0 (Timer)
+        
+        // IRQ10, IRQ11, IRQ14, IRQ15 (virtio-blk might be any of these)
+        IDT[42].set_handler_fn(irq10_stub as *const () as u64);
+        IDT[43].set_handler_fn(irq11_stub as *const () as u64);
+        IDT[46].set_handler_fn(irq14_stub as *const () as u64);
+        IDT[47].set_handler_fn(irq15_stub as *const () as u64);
         
         IDT_PTR.limit = (size_of::<[IdtEntry; 256]>() - 1) as u16;
         IDT_PTR.base = IDT.as_ptr() as u64;
@@ -98,6 +108,39 @@ core::arch::global_asm!(
 );
 
 core::arch::global_asm!(
+    ".global irq10_stub",
+    "irq10_stub:",
+    "push 0",
+    "push 42",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq11_stub",
+    "irq11_stub:",
+    "push 0",
+    "push 43",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq14_stub",
+    "irq14_stub:",
+    "push 0",
+    "push 46",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq15_stub",
+    "irq15_stub:",
+    "push 0",
+    "push 47",
+    "jmp exception_common"
+);
+
+
+core::arch::global_asm!(
     "exception_common:",
     // Save GP registers to construct an InterruptFrame
     "push rax",
@@ -121,9 +164,9 @@ core::arch::global_asm!(
     "mov rdi, rsp",
     "call exception_handler",
     
-    // For IRQ0 (Timer), the handler might return.
+    // For IRQ0 (Timer) and IRQ14, the handler might return.
     // If it does, we need to restore context.
-    // Notice that `exception_handler` returns if vector == 32!
+    // Notice that `exception_handler` returns if vector == 32 or 46!
     
     "pop r15",
     "pop r14",
@@ -191,8 +234,12 @@ pub extern "C" fn exception_handler(frame: *const ExceptionFrame) {
             serial.write_str("[KERNEL TIMER] tick ");
             serial.write_hex(TICK_COUNT);
             if let Some(id) = crate::task::current_task_id() {
-                serial.write_str(", preempting Task ");
-                serial.write_hex(id);
+                if id == crate::task::IDLE_TASK_ID {
+                    serial.write_str(", preempting Idle Task");
+                } else {
+                    serial.write_str(", preempting Task ");
+                    serial.write_hex(id);
+                }
             }
             serial.write_str(" at RIP=");
             serial.write_hex(frame.rip);
@@ -203,6 +250,23 @@ pub extern "C" fn exception_handler(frame: *const ExceptionFrame) {
             // Force preemption immediately for the test
             crate::task::schedule();
         }
+        return;
+    } else if frame.vector >= 42 && frame.vector <= 47 {
+        // IRQ10=42, IRQ11=43, IRQ14=46, IRQ15=47
+        let irq_num = frame.vector - 32;
+        
+        let mut serial = crate::SerialPort(0x3F8);
+        serial.write_str("[KERNEL IRQ] Fired IRQ ");
+        serial.write_hex(irq_num as u64);
+        serial.write_str("\n");
+        
+        unsafe {
+            crate::pic::end_of_interrupt(irq_num as u8);
+        }
+        
+        // Wake tasks waiting on this IRQ
+        crate::ipc::wake_irq(irq_num as u8);
+        
         return;
     }
     

@@ -67,6 +67,63 @@ impl FrameAllocator {
         self.total_frames += 1;
     }
 
+    /// Allocates a contiguous sequence of `count` frames.
+    pub fn allocate_contiguous_frames(&mut self, count: usize) -> Option<u64> {
+        if count == 0 { return None; }
+        if count == 1 { return self.allocate_frame(); }
+
+        let mut current_opt = self.head;
+        let mut prev_ptr = &mut self.head as *mut Option<u64>;
+
+        while let Some(current_addr) = current_opt {
+            let mut check_addr = current_addr;
+            let mut found_count = 1;
+            
+            let mut peek_opt = unsafe { core::ptr::read((check_addr + self.phys_offset) as *const Option<u64>) };
+            let mut lowest_addr = current_addr;
+            
+            // Detect direction on first step
+            if let Some(next_addr) = peek_opt {
+                let direction = if next_addr == check_addr - PAGE_SIZE {
+                    -1
+                } else if next_addr == check_addr + PAGE_SIZE {
+                    1
+                } else {
+                    0
+                };
+                
+                if direction != 0 {
+                    while let Some(n_addr) = peek_opt {
+                        let expected = if direction == 1 { check_addr + PAGE_SIZE } else { check_addr - PAGE_SIZE };
+                        if n_addr == expected {
+                            found_count += 1;
+                            if n_addr < lowest_addr {
+                                lowest_addr = n_addr;
+                            }
+                            if found_count == count {
+                                unsafe {
+                                    let next_after_chain = core::ptr::read((n_addr + self.phys_offset) as *const Option<u64>);
+                                    core::ptr::write(prev_ptr, next_after_chain);
+                                }
+                                self.total_frames -= count;
+                                return Some(lowest_addr);
+                            }
+                            check_addr = n_addr;
+                            peek_opt = unsafe { core::ptr::read((check_addr + self.phys_offset) as *const Option<u64>) };
+                        } else {
+                            break; // Break in contiguity
+                        }
+                    }
+                }
+            }
+            
+            prev_ptr = (current_addr + self.phys_offset) as *mut Option<u64>;
+            current_opt = unsafe { core::ptr::read(prev_ptr) };
+        }
+        
+        None
+    }
+
     /// Iterates through the free list and coalesces contiguous frames into a single region.
     /// This is slow (O(N)), but only called once during boot to mint Untyped capabilities.
     pub fn extract_largest_contiguous(&mut self) -> Option<(u64, u64)> {

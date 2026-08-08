@@ -73,6 +73,8 @@ impl Task {
 
 // Global task list (for v0, we can just use a simple static array)
 pub const MAX_TASKS: usize = 16;
+pub const IDLE_TASK_ID: u64 = (MAX_TASKS - 1) as u64;
+
 static mut TASKS: [Option<Task>; MAX_TASKS] = [
     None, None, None, None, None, None, None, None,
     None, None, None, None, None, None, None, None,
@@ -110,21 +112,28 @@ pub unsafe fn schedule() {
     let current_id = CURRENT_TASK_ID.unwrap();
     let mut next_id = current_id + 1;
     
-    // Find the next runnable task
-    loop {
-        if next_id >= MAX_TASKS as u64 {
+    // Find the next runnable task (excluding the Idle Task)
+    let mut found = false;
+    for _ in 0..MAX_TASKS - 1 {
+        if next_id >= IDLE_TASK_ID {
             next_id = 0;
         }
         if let Some(ref t) = TASKS[next_id as usize] {
             if t.state == TaskState::Runnable {
+                found = true;
                 break;
             }
         }
-        if next_id == current_id {
-            // No other runnable tasks! (In a real OS, idle task would run)
-            return;
-        }
         next_id += 1;
+    }
+    
+    if !found {
+        // No normal tasks are runnable. Fall back to the Idle Task.
+        next_id = IDLE_TASK_ID;
+    }
+    
+    if next_id == current_id {
+        return; // Still the same task, no context switch needed
     }
     
     // Perform context switch
@@ -220,7 +229,30 @@ core::arch::global_asm!(
     "iretq"
 );
 
+core::arch::global_asm!(
+    ".global jump_to_kernel_task",
+    "jump_to_kernel_task:",
+    // rdi = kernel_rip
+    // rsi = kernel_rsp
+    
+    "cli",
+    
+    // Push SS (Kernel Data = 0x10)
+    "push 0x10",
+    // Push Kernel RSP
+    "push rsi",
+    // Push RFLAGS (IF bit SET = 0x202)
+    "push 0x202",
+    // Push CS (Kernel Code = 0x8)
+    "push 0x8",
+    // Push Kernel RIP
+    "push rdi",
+    
+    "iretq"
+);
+
 extern "C" {
     pub fn switch_context(prev: *mut TaskContext, next: *const TaskContext);
     pub fn jump_to_user(user_rip: u64, user_rsp: u64) -> !;
+    pub fn jump_to_kernel_task(kernel_rip: u64, kernel_rsp: u64) -> !;
 }

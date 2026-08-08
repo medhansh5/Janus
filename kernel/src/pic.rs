@@ -76,6 +76,9 @@ pub unsafe fn unmask(irq: u8) {
         port = PIC1_DATA;
     } else {
         port = PIC2_DATA;
+        // Unmask IRQ 2 on master PIC to allow cascade
+        let v_master = inb(PIC1_DATA) & !(1 << 2);
+        outb(PIC1_DATA, v_master);
     }
     value = inb(port) & !(1 << (irq % 8));
     outb(port, value);
