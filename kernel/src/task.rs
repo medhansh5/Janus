@@ -5,9 +5,13 @@ use x86_64::PhysAddr;
 pub enum TaskState {
     Runnable,
     /// Blocked waiting to receive a message on the specified endpoint capability
-    BlockedOnRecv { endpoint: CPtr },
+    BlockedOnRecv {
+        endpoint: CPtr,
+    },
     /// Blocked waiting to send a message on the specified endpoint capability
-    BlockedOnSend { endpoint: CPtr },
+    BlockedOnSend {
+        endpoint: CPtr,
+    },
     /// Terminated by the kernel due to a fault or security violation
     Terminated,
 }
@@ -76,8 +80,7 @@ pub const MAX_TASKS: usize = 16;
 pub const IDLE_TASK_ID: u64 = (MAX_TASKS - 1) as u64;
 
 static mut TASKS: [Option<Task>; MAX_TASKS] = [
-    None, None, None, None, None, None, None, None,
-    None, None, None, None, None, None, None, None,
+    None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
 ];
 static mut CURRENT_TASK_ID: Option<u64> = None;
 
@@ -111,7 +114,7 @@ pub unsafe fn current_task_mut<'a>() -> Option<&'a mut Task> {
 pub unsafe fn schedule() {
     let current_id = CURRENT_TASK_ID.unwrap();
     let mut next_id = current_id + 1;
-    
+
     // Find the next runnable task (excluding the Idle Task)
     let mut found = false;
     for _ in 0..MAX_TASKS - 1 {
@@ -126,32 +129,39 @@ pub unsafe fn schedule() {
         }
         next_id += 1;
     }
-    
+
     if !found {
         // No normal tasks are runnable. Fall back to the Idle Task.
         next_id = IDLE_TASK_ID;
     }
-    
+
     if next_id == current_id {
         return; // Still the same task, no context switch needed
     }
-    
+
     // Perform context switch
     let prev = get_task_mut(current_id).unwrap();
     let next = get_task_mut(next_id).unwrap();
-    
+
     CURRENT_TASK_ID = Some(next_id);
-    
+
+    let mut serial = crate::SerialPort(0x3F8);
+    serial.write_str("[SCHEDULER] Switching from Task ");
+    serial.write_hex(current_id);
+    serial.write_str(" to Task ");
+    serial.write_hex(next_id);
+    serial.write_str("\n");
+
     // Update TSS RSP0 to the new task's kernel stack (for interrupts)
     crate::gdt::set_kernel_stack(next.kernel_stack_top);
-    
+
     // Also update the scratch variable for `syscall`
     unsafe {
         crate::syscall::KERNEL_RSP_SCRATCH = next.kernel_stack_top;
     }
-    
+
     // Switch CR3 to the new task's page table
-    let cr3_val = next.page_table.as_u64() | 0x3; // PRESENT | WRITABLE? Actually CR3 doesn't need these flags, but some do. Just phys addr is fine.
+    let _cr3_val = next.page_table.as_u64() | 0x3; // PRESENT | WRITABLE? Actually CR3 doesn't need these flags, but some do. Just phys addr is fine.
     core::arch::asm!(
         "mov cr3, {0}",
         in(reg) next.page_table.as_u64(),
@@ -165,14 +175,12 @@ pub unsafe fn set_current_task(id: u64) {
     CURRENT_TASK_ID = Some(id);
 }
 
-/// The context switch assembly routine.
-/// Defined in naked assembly to preserve registers perfectly.
 core::arch::global_asm!(
     ".global switch_context",
     "switch_context:",
     // rdi = *mut TaskContext (prev)
     // rsi = *const TaskContext (next)
-    
+
     // Save current context into `prev`
     "mov [rdi + 0x00], r15",
     "mov [rdi + 0x08], r14",
@@ -181,11 +189,11 @@ core::arch::global_asm!(
     "mov [rdi + 0x20], rbx",
     "mov [rdi + 0x28], rbp",
     "mov [rdi + 0x30], rsi",
-    "mov [rdi + 0x38], rdi", 
-    "mov [rdi + 0x40], rsp",  // Save RSP (points to return address from `call switch_context`)
+    "mov [rdi + 0x38], rdi",
+    "mov [rdi + 0x40], rsp", // Save RSP (points to return address from `call switch_context`)
     // rip is saved implicitly: [rsp] holds the return address. We don't need to save it
     // separately because we'll use `ret` to return to it.
-    
+
     // Restore context from `next`
     "mov r15, [rsi + 0x00]",
     "mov r14, [rsi + 0x08]",
@@ -196,7 +204,6 @@ core::arch::global_asm!(
     "mov rdi, [rsi + 0x38]",
     "mov rsp, [rsi + 0x40]", // Restore RSP (points to saved return address)
     "mov rsi, [rsi + 0x30]", // Restore next.rsi (do this last since rsi was used as the pointer)
-    
     // `ret` pops [rsp] and jumps to it — the return address from the original
     // `call switch_context` in yield_cpu(). This properly unwinds the call frame.
     "ret"
@@ -207,13 +214,12 @@ core::arch::global_asm!(
     "jump_to_user:",
     // rdi = user_rip
     // rsi = user_rsp
-    
+
     // Disable interrupts before setting up state to avoid getting interrupted mid-transition
     "cli",
-    
     // iretq requires a 5-word frame on the stack:
     // SS, RSP, RFLAGS, CS, RIP
-    
+
     // Push SS (User Data = 0x1B)
     "push 0x1B",
     // Push User RSP
@@ -224,7 +230,6 @@ core::arch::global_asm!(
     "push 0x23",
     // Push User RIP
     "push rdi",
-    
     // Switch to user stack is handled by iretq popping RSP
     "iretq"
 );
@@ -234,9 +239,7 @@ core::arch::global_asm!(
     "jump_to_kernel_task:",
     // rdi = kernel_rip
     // rsi = kernel_rsp
-    
     "cli",
-    
     // Push SS (Kernel Data = 0x10)
     "push 0x10",
     // Push Kernel RSP
@@ -247,7 +250,6 @@ core::arch::global_asm!(
     "push 0x8",
     // Push Kernel RIP
     "push rdi",
-    
     "iretq"
 );
 

@@ -1,6 +1,5 @@
-use core::mem::size_of;
-use core::arch::asm;
 use crate::gdt;
+use core::arch::asm;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
@@ -27,7 +26,7 @@ impl IdtEntry {
 
     pub fn set_handler_fn(&mut self, handler: u64) {
         self.offset_low = handler as u16;
-        self.segment_selector = unsafe { gdt::SELECTORS.get().unwrap().kernel_code.0 };
+        self.segment_selector = gdt::SELECTORS.get().unwrap().kernel_code.0;
         self.options = 0x8E00; // Present (1) | DPL (00) | Storage (0) | Type (1110 = 0xE = Interrupt Gate) -> 0x8E00
         self.offset_mid = (handler >> 16) as u16;
         self.offset_high = (handler >> 32) as u32;
@@ -59,22 +58,22 @@ extern "C" {
 pub fn init() {
     unsafe {
         // Initialize common exception handlers
-        IDT[13].set_handler_fn(general_protection_fault_stub as u64); // #GP
-        IDT[14].set_handler_fn(page_fault_stub as u64); // #PF
-        
-        // We will add the Timer handler here later (Vector 32)
-        IDT[32].set_handler_fn(timer_stub as *const () as u64); // IRQ0 (Timer)
-        
-        // IRQ10, IRQ11, IRQ14, IRQ15 (virtio-blk might be any of these)
-        IDT[42].set_handler_fn(irq10_stub as *const () as u64);
-        IDT[43].set_handler_fn(irq11_stub as *const () as u64);
-        IDT[46].set_handler_fn(irq14_stub as *const () as u64);
-        IDT[47].set_handler_fn(irq15_stub as *const () as u64);
-        
-        IDT_PTR.limit = (size_of::<[IdtEntry; 256]>() - 1) as u16;
-        IDT_PTR.base = IDT.as_ptr() as u64;
+        IDT[13].set_handler_fn(general_protection_fault_stub as *const () as usize as u64); // #GP
+        IDT[14].set_handler_fn(page_fault_stub as *const () as usize as u64); // #PF
 
-        asm!("lidt [{}]", in(reg) &IDT_PTR, options(readonly, nostack, preserves_flags));
+        // We will add the Timer handler here later (Vector 32)
+        IDT[32].set_handler_fn(timer_stub as *const () as usize as u64); // IRQ0 (Timer)
+
+        // IRQ10, IRQ11, IRQ14, IRQ15 (virtio-blk might be any of these)
+        IDT[42].set_handler_fn(irq10_stub as *const () as usize as u64);
+        IDT[43].set_handler_fn(irq11_stub as *const () as usize as u64);
+        IDT[46].set_handler_fn(irq14_stub as *const () as usize as u64);
+        IDT[47].set_handler_fn(irq15_stub as *const () as usize as u64);
+
+        IDT_PTR.limit = (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16;
+        IDT_PTR.base = core::ptr::addr_of!(IDT) as u64;
+
+        core::arch::asm!("lidt [{}]", in(reg) core::ptr::addr_of!(IDT_PTR), options(readonly, nostack, preserves_flags));
     }
 }
 
@@ -102,7 +101,7 @@ core::arch::global_asm!(
     ".global timer_stub",
     "timer_stub:",
     // Hardware DOES NOT push an error code for IRQ0
-    "push 0", // Dummy error code
+    "push 0",  // Dummy error code
     "push 32", // Push vector number
     "jmp exception_common"
 );
@@ -139,7 +138,6 @@ core::arch::global_asm!(
     "jmp exception_common"
 );
 
-
 core::arch::global_asm!(
     "exception_common:",
     // Save GP registers to construct an InterruptFrame
@@ -158,16 +156,13 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    
     // RSP now points to the top of our extended InterruptFrame.
     // Call the Rust handler with a pointer to the frame.
     "mov rdi, rsp",
     "call exception_handler",
-    
     // For IRQ0 (Timer) and IRQ14, the handler might return.
     // If it does, we need to restore context.
     // Notice that `exception_handler` returns if vector == 32 or 46!
-    
     "pop r15",
     "pop r14",
     "pop r13",
@@ -183,9 +178,7 @@ core::arch::global_asm!(
     "pop rdx",
     "pop rcx",
     "pop rax",
-    
     "add rsp, 16", // Skip vector and error_code
-    
     "iretq"
 );
 
@@ -199,8 +192,8 @@ pub struct ExceptionFrame {
     pub r12: u64,
     pub r11: u64,
     pub r10: u64,
-    pub r9:  u64,
-    pub r8:  u64,
+    pub r9: u64,
+    pub r8: u64,
     pub rdi: u64,
     pub rsi: u64,
     pub rbp: u64,
@@ -208,15 +201,15 @@ pub struct ExceptionFrame {
     pub rdx: u64,
     pub rcx: u64,
     pub rax: u64,
-    
+
     pub vector: u64,
     pub error_code: u64,
-    
+
     pub rip: u64,
-    pub cs:  u64,
+    pub cs: u64,
     pub rflags: u64,
     pub rsp: u64,
-    pub ss:  u64,
+    pub ss: u64,
 }
 
 static mut TICK_COUNT: u64 = 0;
@@ -224,29 +217,14 @@ static mut TICK_COUNT: u64 = 0;
 #[no_mangle]
 pub extern "C" fn exception_handler(frame: *const ExceptionFrame) {
     let frame = unsafe { &*frame };
-    
+
     if frame.vector == 32 {
         // Timer Interrupt
         unsafe {
             TICK_COUNT += 1;
-            // Print every tick to prove it's firing and preempting
-            let mut serial = crate::SerialPort(0x3F8);
-            serial.write_str("[KERNEL TIMER] tick ");
-            serial.write_hex(TICK_COUNT);
-            if let Some(id) = crate::task::current_task_id() {
-                if id == crate::task::IDLE_TASK_ID {
-                    serial.write_str(", preempting Idle Task");
-                } else {
-                    serial.write_str(", preempting Task ");
-                    serial.write_hex(id);
-                }
-            }
-            serial.write_str(" at RIP=");
-            serial.write_hex(frame.rip);
-            serial.write_str("\n");
-            
+
             crate::pic::end_of_interrupt(0);
-            
+
             // Force preemption immediately for the test
             crate::task::schedule();
         }
@@ -254,30 +232,30 @@ pub extern "C" fn exception_handler(frame: *const ExceptionFrame) {
     } else if frame.vector >= 42 && frame.vector <= 47 {
         // IRQ10=42, IRQ11=43, IRQ14=46, IRQ15=47
         let irq_num = frame.vector - 32;
-        
+
         let mut serial = crate::SerialPort(0x3F8);
         serial.write_str("[KERNEL IRQ] Fired IRQ ");
         serial.write_hex(irq_num as u64);
         serial.write_str("\n");
-        
+
         unsafe {
             crate::pic::end_of_interrupt(irq_num as u8);
         }
-        
+
         // Wake tasks waiting on this IRQ
         crate::ipc::wake_irq(irq_num as u8);
-        
+
         return;
     }
-    
+
     let mut serial = crate::SerialPort(0x3F8);
-    
+
     serial.write_str("\n[KERNEL PANIC] Exception ");
     serial.write_hex(frame.vector);
     serial.write_str(" (Error Code: ");
     serial.write_hex(frame.error_code);
     serial.write_str(")\n");
-    
+
     if frame.vector == 14 {
         let cr2: u64;
         unsafe { asm!("mov {}, cr2", out(reg) cr2) };
@@ -285,13 +263,13 @@ pub extern "C" fn exception_handler(frame: *const ExceptionFrame) {
         serial.write_hex(cr2);
         serial.write_str("\n");
     }
-    
+
     serial.write_str("RIP: ");
     serial.write_hex(frame.rip);
     serial.write_str(" RSP: ");
     serial.write_hex(frame.rsp);
     serial.write_str("\n");
-    
+
     serial.write_str("System halted.\n");
     loop {
         unsafe { asm!("hlt") };

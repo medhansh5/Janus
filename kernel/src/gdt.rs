@@ -1,5 +1,5 @@
+use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
-use x86_64::structures::gdt::{GlobalDescriptorTable, Descriptor, SegmentSelector};
 use x86_64::VirtAddr;
 
 use spin::Once;
@@ -27,13 +27,13 @@ pub unsafe fn init() {
     tss.privilege_stack_table[0] = VirtAddr::new(0); // We'll update this on task switch
 
     let mut gdt = GlobalDescriptorTable::new();
-    
+
     // We MUST define them in this exact order for SYSRET/SYSCALL to work correctly!
     let kernel_code = gdt.append(Descriptor::kernel_code_segment());
     let kernel_data = gdt.append(Descriptor::kernel_data_segment());
     let user_data = gdt.append(Descriptor::user_data_segment());
     let user_code = gdt.append(Descriptor::user_code_segment());
-    
+
     let tss_ref = TSS.call_once(|| tss);
     let tss_selector = gdt.append(Descriptor::tss_segment(tss_ref));
 
@@ -45,7 +45,7 @@ pub unsafe fn init() {
 
     CS::set_reg(kernel_code);
     SS::set_reg(kernel_data);
-    
+
     // We don't strictly need these in 64-bit mode, but it's good practice.
     DS::set_reg(kernel_data);
     ES::set_reg(kernel_data);

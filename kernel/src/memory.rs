@@ -10,7 +10,11 @@ pub struct FrameAllocator {
 
 impl FrameAllocator {
     pub const fn new() -> Self {
-        Self { head: None, total_frames: 0, phys_offset: 0 }
+        Self {
+            head: None,
+            total_frames: 0,
+            phys_offset: 0,
+        }
     }
 
     pub fn set_phys_offset(&mut self, offset: u64) {
@@ -23,15 +27,18 @@ impl FrameAllocator {
     /// accessible at `paddr`.
     pub unsafe fn init(&mut self, boot_info: *const BootInfo) {
         let boot_info_ref = &*boot_info;
-        let regions = core::slice::from_raw_parts(boot_info_ref.memory_regions_ptr, boot_info_ref.memory_regions_count);
-        
+        let regions = core::slice::from_raw_parts(
+            boot_info_ref.memory_regions_ptr,
+            boot_info_ref.memory_regions_count,
+        );
+
         for region in regions {
             if region.kind == MemoryRegionKind::Usable {
                 let start = region.start;
                 let end = region.start + region.size;
                 let mut current = start;
-                
-                // Skip address 0 (null pointer) to prevent Option<u64> confusion, 
+
+                // Skip address 0 (null pointer) to prevent Option<u64> confusion,
                 // though Option<NonZeroU64> would be safer.
                 if current == 0 {
                     current += PAGE_SIZE;
@@ -69,8 +76,12 @@ impl FrameAllocator {
 
     /// Allocates a contiguous sequence of `count` frames.
     pub fn allocate_contiguous_frames(&mut self, count: usize) -> Option<u64> {
-        if count == 0 { return None; }
-        if count == 1 { return self.allocate_frame(); }
+        if count == 0 {
+            return None;
+        }
+        if count == 1 {
+            return self.allocate_frame();
+        }
 
         let mut current_opt = self.head;
         let mut prev_ptr = &mut self.head as *mut Option<u64>;
@@ -78,10 +89,11 @@ impl FrameAllocator {
         while let Some(current_addr) = current_opt {
             let mut check_addr = current_addr;
             let mut found_count = 1;
-            
-            let mut peek_opt = unsafe { core::ptr::read((check_addr + self.phys_offset) as *const Option<u64>) };
+
+            let mut peek_opt =
+                unsafe { core::ptr::read((check_addr + self.phys_offset) as *const Option<u64>) };
             let mut lowest_addr = current_addr;
-            
+
             // Detect direction on first step
             if let Some(next_addr) = peek_opt {
                 let direction = if next_addr == check_addr - PAGE_SIZE {
@@ -91,10 +103,14 @@ impl FrameAllocator {
                 } else {
                     0
                 };
-                
+
                 if direction != 0 {
                     while let Some(n_addr) = peek_opt {
-                        let expected = if direction == 1 { check_addr + PAGE_SIZE } else { check_addr - PAGE_SIZE };
+                        let expected = if direction == 1 {
+                            check_addr + PAGE_SIZE
+                        } else {
+                            check_addr - PAGE_SIZE
+                        };
                         if n_addr == expected {
                             found_count += 1;
                             if n_addr < lowest_addr {
@@ -102,25 +118,31 @@ impl FrameAllocator {
                             }
                             if found_count == count {
                                 unsafe {
-                                    let next_after_chain = core::ptr::read((n_addr + self.phys_offset) as *const Option<u64>);
+                                    let next_after_chain = core::ptr::read(
+                                        (n_addr + self.phys_offset) as *const Option<u64>,
+                                    );
                                     core::ptr::write(prev_ptr, next_after_chain);
                                 }
                                 self.total_frames -= count;
                                 return Some(lowest_addr);
                             }
                             check_addr = n_addr;
-                            peek_opt = unsafe { core::ptr::read((check_addr + self.phys_offset) as *const Option<u64>) };
+                            peek_opt = unsafe {
+                                core::ptr::read(
+                                    (check_addr + self.phys_offset) as *const Option<u64>,
+                                )
+                            };
                         } else {
                             break; // Break in contiguity
                         }
                     }
                 }
             }
-            
+
             prev_ptr = (current_addr + self.phys_offset) as *mut Option<u64>;
             current_opt = unsafe { core::ptr::read(prev_ptr) };
         }
-        
+
         None
     }
 
@@ -131,9 +153,9 @@ impl FrameAllocator {
         // we'll just scan the free list, find the longest contiguous sequence,
         // remove it from the list, and return it.
         // Even simpler: just return the remaining frames as 4KB capabilities until we run out of slots,
-        // OR rely on the fact that our initial allocator setup pushes frames in order, 
+        // OR rely on the fact that our initial allocator setup pushes frames in order,
         // so the list is already mostly contiguous chunks.
-        
+
         // Actually, the simplest approach for v0 init is to pop chunks that are already contiguous
         // in the list.
         if self.head.is_none() {
@@ -142,7 +164,7 @@ impl FrameAllocator {
 
         let mut current = self.head.unwrap();
         let mut size = 4096;
-        let mut prev_ptr = &mut self.head as *mut Option<u64>;
+        let prev_ptr = &mut self.head as *mut Option<u64>;
 
         unsafe {
             loop {
@@ -159,7 +181,7 @@ impl FrameAllocator {
                         // Splice the list.
                         core::ptr::write(prev_ptr, Some(next));
                         self.total_frames -= 1; // for the head frame
-                        // The region starts at the lowest address (current)
+                                                // The region starts at the lowest address (current)
                         return Some((current, size));
                     }
                 } else {

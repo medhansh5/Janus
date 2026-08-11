@@ -5,7 +5,6 @@ use core::mem::size_of;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CPtr(pub usize);
 
-/// Memory permission flags.
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct MemoryFlags: u64 {
@@ -22,32 +21,17 @@ pub enum Capability {
     Empty,
     /// An Untyped capability representing raw, unallocated physical memory.
     /// The init process must explicitly retype this into usable objects.
-    Untyped {
-        paddr: u64,
-        size: u64,
-    },
+    Untyped { paddr: u64, size: u64 },
     /// An Endpoint capability for synchronous messaging.
-    Endpoint {
-        target_task_id: u64,
-    },
+    Endpoint { target_task_id: u64 },
     /// A capability granting access to another CNode.
-    CNode {
-        paddr: u64,
-        size: u64,
-    },
+    CNode { paddr: u64, size: u64 },
     /// A capability granting access to a physical page of memory.
-    Frame {
-        paddr: u64,
-    },
+    Frame { paddr: u64 },
     /// A capability granting access to a specific range of I/O ports.
-    IOPort {
-        base: u16,
-        size: u16,
-    },
+    IOPort { base: u16, size: u16 },
     /// A capability to wait for a hardware IRQ.
-    InterruptEndpoint {
-        irq: u8,
-    }
+    InterruptEndpoint { irq: u8 },
 }
 
 /// A Capability Node (CNode) is a table of capabilities.
@@ -62,7 +46,7 @@ pub struct CNode {
 impl CNode {
     /// Creates a new CNode with all empty slots.
     pub const fn empty() -> Self {
-        // Since Capability is not Copy due to being a complex enum (wait, we derived Copy!), 
+        // Since Capability is not Copy due to being a complex enum (wait, we derived Copy!),
         // we can initialize it like this.
         Self {
             slots: [Capability::Empty; CNODE_SLOTS],
