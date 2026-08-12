@@ -40,11 +40,11 @@ global_asm!(
     // Construct the hardware-like Interrupt Frame (for iretq)
     // 0x1B = User Data Segment | Ring 3 (Index 3)
     // 0x23 = User Code Segment | Ring 3 (Index 4)
-    "push 0x1B",               // SS
+    "push 0x1B",                     // SS
     "push [rip + USER_RSP_SCRATCH]", // RSP
-    "push r11",                // RFLAGS (syscall saves RFLAGS in R11)
-    "push 0x23",               // CS
-    "push rcx",                // RIP (syscall saves RIP in RCX)
+    "push r11",                      // RFLAGS (syscall saves RFLAGS in R11)
+    "push 0x23",                     // CS
+    "push rcx",                      // RIP (syscall saves RIP in RCX)
     // Push general purpose registers in the order of TaskContext
     "push rax",
     "push rcx",
