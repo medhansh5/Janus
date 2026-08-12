@@ -26,8 +26,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Check
-        run: cargo check --workspace
+      - name: Host Checks
+        run: |
+          cargo +nightly check -p boot-info
+          cargo +nightly check -p kernel --lib
+          cargo +nightly test -p boot-info
+          cargo +nightly test -p kernel --lib
 
-      - name: Test
-        run: cargo test --workspace
+      - name: Bare-Metal Checks
+        run: |
+          cargo +nightly build -p kernel --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc
+          cargo +nightly build -p bootloader --target x86_64-unknown-uefi -Zbuild-std=core,compiler_builtins,alloc

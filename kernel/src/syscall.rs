@@ -35,13 +35,13 @@ pub unsafe fn init() {
 global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
-    "mov [USER_RSP_SCRATCH], rsp",
-    "mov rsp, [KERNEL_RSP_SCRATCH]",
+    "mov [rip + USER_RSP_SCRATCH], rsp",
+    "mov rsp, [rip + KERNEL_RSP_SCRATCH]",
     // Construct the hardware-like Interrupt Frame (for iretq)
     // 0x1B = User Data Segment | Ring 3 (Index 3)
     // 0x23 = User Code Segment | Ring 3 (Index 4)
     "push 0x1B",               // SS
-    "push [USER_RSP_SCRATCH]", // RSP
+    "push [rip + USER_RSP_SCRATCH]", // RSP
     "push r11",                // RFLAGS (syscall saves RFLAGS in R11)
     "push 0x23",               // CS
     "push rcx",                // RIP (syscall saves RIP in RCX)

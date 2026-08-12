@@ -1,3 +1,5 @@
+cargo-features = ["panic-immediate-abort"]
+
 [workspace]
 members = [
     "boot-info",
@@ -5,3 +7,9 @@ members = [
     "kernel",
 ]
 resolver = "2"
+
+[profile.dev]
+panic = "immediate-abort"
+
+[profile.release]
+panic = "immediate-abort"

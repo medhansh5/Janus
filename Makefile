@@ -6,10 +6,10 @@ OVMF = /usr/share/ovmf/OVMF.fd
 all: bootloader kernel
 
 bootloader:
-	cd bootloader && cargo build --target x86_64-unknown-uefi
+	cd bootloader && cargo build --target x86_64-unknown-uefi -Zbuild-std=core,compiler_builtins,alloc
 
 kernel:
-	cd kernel && cargo build --target x86_64-unknown-none
+	cd kernel && cargo build --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc
 
 run: all
 	mkdir -p esp/EFI/BOOT
