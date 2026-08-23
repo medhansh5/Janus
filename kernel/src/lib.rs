@@ -35,7 +35,7 @@ impl SerialPort {
             );
             core::arch::asm!(
                 "out dx, al",
-                in("dx") port + 0,
+                in("dx") port,
                 in("al") 0x03u8,
             );
             core::arch::asm!(
@@ -100,12 +100,13 @@ impl SerialPort {
             }
             i -= 1;
         }
-        for j in i..=15 {
-            if buf[j] != 0 {
-                self.write_byte(buf[j]);
+        for &b in &buf[i..=15] {
+            if b != 0 {
+                self.write_byte(b);
             }
         }
     }
+
 }
 
 #[macro_export]

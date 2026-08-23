@@ -23,6 +23,8 @@ unsafe fn inb(port: u16) -> u8 {
     val
 }
 
+/// # Safety
+/// Must be called during single-threaded kernel boot to remap 8259 PIC vectors.
 pub unsafe fn init() {
     let offset1 = 32;
     let offset2 = 40;
@@ -62,6 +64,8 @@ pub unsafe fn init() {
     outb(PIC2_DATA, a2);
 }
 
+/// # Safety
+/// `irq` must be a valid hardware IRQ index (0..15).
 pub unsafe fn end_of_interrupt(irq: u8) {
     if irq >= 8 {
         outb(PIC2_COMMAND, PIC_EOI);
@@ -69,29 +73,26 @@ pub unsafe fn end_of_interrupt(irq: u8) {
     outb(PIC1_COMMAND, PIC_EOI);
 }
 
+/// # Safety
+/// `irq` must be a valid hardware IRQ index (0..15).
 pub unsafe fn unmask(irq: u8) {
-    let port;
-    let value;
-    if irq < 8 {
-        port = PIC1_DATA;
+    let port = if irq < 8 {
+        PIC1_DATA
     } else {
-        port = PIC2_DATA;
         // Unmask IRQ 2 on master PIC to allow cascade
         let v_master = inb(PIC1_DATA) & !(1 << 2);
         outb(PIC1_DATA, v_master);
-    }
-    value = inb(port) & !(1 << (irq % 8));
+        PIC2_DATA
+    };
+    let value = inb(port) & !(1 << (irq % 8));
     outb(port, value);
 }
 
+/// # Safety
+/// `irq` must be a valid hardware IRQ index (0..15).
 pub unsafe fn mask(irq: u8) {
-    let port;
-    let value;
-    if irq < 8 {
-        port = PIC1_DATA;
-    } else {
-        port = PIC2_DATA;
-    }
-    value = inb(port) | (1 << (irq % 8));
+    let port = if irq < 8 { PIC1_DATA } else { PIC2_DATA };
+    let value = inb(port) | (1 << (irq % 8));
     outb(port, value);
 }
+

@@ -20,6 +20,10 @@ pub struct Selectors {
 
 pub static SELECTORS: Once<Selectors> = Once::new();
 
+/// Initializes the Global Descriptor Table (GDT) and Task State Segment (TSS).
+///
+/// # Safety
+/// Must be called during single-threaded kernel boot before ring transitions or syscall setup.
 pub unsafe fn init() {
     let mut tss = TaskStateSegment::new();
     // Set up a basic TSS (useful later for interrupts and syscall ring transitions)
@@ -66,6 +70,9 @@ pub unsafe fn init() {
 /// Updates the RSP0 field in the TSS.
 /// This must be called during a context switch so that if a user task is interrupted
 /// or makes a syscall, the CPU knows where to find the kernel stack for that task.
+///
+/// # Safety
+/// `rsp0` must point to a valid, aligned kernel stack boundary.
 pub unsafe fn set_kernel_stack(rsp0: u64) {
     if let Some(tss) = TSS.get() {
         // Safe because the TSS is only read/written from a single core
@@ -74,3 +81,4 @@ pub unsafe fn set_kernel_stack(rsp0: u64) {
         tss_mut.privilege_stack_table[0] = VirtAddr::new(rsp0);
     }
 }
+

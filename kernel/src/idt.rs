@@ -214,9 +214,13 @@ pub struct ExceptionFrame {
 
 static mut TICK_COUNT: u64 = 0;
 
+/// Main exception handling dispatcher.
+///
+/// # Safety
+/// `frame` must be a valid pointer to an ExceptionFrame allocated on the stack by exception stubs.
 #[no_mangle]
-pub extern "C" fn exception_handler(frame: *const ExceptionFrame) {
-    let frame = unsafe { &*frame };
+pub unsafe extern "C" fn exception_handler(frame: *const ExceptionFrame) {
+    let frame = &*frame;
 
     if frame.vector == 32 {
         // Timer Interrupt
@@ -229,14 +233,15 @@ pub extern "C" fn exception_handler(frame: *const ExceptionFrame) {
             crate::task::schedule();
         }
         return;
-    } else if frame.vector >= 42 && frame.vector <= 47 {
+    } else if (42..=47).contains(&frame.vector) {
         // IRQ10=42, IRQ11=43, IRQ14=46, IRQ15=47
         let irq_num = frame.vector - 32;
 
         let mut serial = crate::SerialPort(0x3F8);
         serial.write_str("[KERNEL IRQ] Fired IRQ ");
-        serial.write_hex(irq_num as u64);
+        serial.write_hex(irq_num);
         serial.write_str("\n");
+
 
         unsafe {
             crate::pic::end_of_interrupt(irq_num as u8);

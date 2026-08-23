@@ -8,6 +8,12 @@ pub struct FrameAllocator {
     phys_offset: u64,
 }
 
+impl Default for FrameAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameAllocator {
     pub const fn new() -> Self {
         Self {
@@ -16,6 +22,7 @@ impl FrameAllocator {
             phys_offset: 0,
         }
     }
+
 
     pub fn set_phys_offset(&mut self, offset: u64) {
         self.phys_offset = offset;
@@ -158,12 +165,9 @@ impl FrameAllocator {
 
         // Actually, the simplest approach for v0 init is to pop chunks that are already contiguous
         // in the list.
-        if self.head.is_none() {
-            return None;
-        }
-
-        let mut current = self.head.unwrap();
+        let mut current = self.head?;
         let mut size = 4096;
+
         let prev_ptr = &mut self.head as *mut Option<u64>;
 
         unsafe {

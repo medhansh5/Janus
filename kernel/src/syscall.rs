@@ -5,7 +5,11 @@ use x86_64::registers::model_specific::{LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 
 /// Initializes the MSRs required for the `syscall` / `sysret` instructions.
+///
+/// # Safety
+/// Must be called after GDT initialization and before executing Ring 3 tasks.
 pub unsafe fn init() {
+
     let selectors = gdt::SELECTORS
         .get()
         .expect("GDT must be initialized before syscalls");

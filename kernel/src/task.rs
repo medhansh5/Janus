@@ -88,6 +88,8 @@ pub fn current_task_id() -> Option<u64> {
     unsafe { CURRENT_TASK_ID }
 }
 
+/// # Safety
+/// Caller must ensure `task` has valid state and stack pointers.
 pub unsafe fn register_task(task: Task) {
     let id = task.id as usize;
     if id < MAX_TASKS {
@@ -95,6 +97,8 @@ pub unsafe fn register_task(task: Task) {
     }
 }
 
+/// # Safety
+/// Caller must guarantee single-threaded access to `id`.
 pub unsafe fn get_task_mut<'a>(id: u64) -> Option<&'a mut Task> {
     if id < MAX_TASKS as u64 {
         TASKS[id as usize].as_mut()
@@ -103,6 +107,8 @@ pub unsafe fn get_task_mut<'a>(id: u64) -> Option<&'a mut Task> {
     }
 }
 
+/// # Safety
+/// Caller must guarantee single-threaded access to current task state.
 pub unsafe fn current_task_mut<'a>() -> Option<&'a mut Task> {
     if let Some(id) = CURRENT_TASK_ID {
         get_task_mut(id)
@@ -111,6 +117,8 @@ pub unsafe fn current_task_mut<'a>() -> Option<&'a mut Task> {
     }
 }
 
+/// # Safety
+/// Must be called with valid task context and stack setups.
 pub unsafe fn schedule() {
     let current_id = CURRENT_TASK_ID.unwrap();
     let mut next_id = current_id + 1;
@@ -171,9 +179,12 @@ pub unsafe fn schedule() {
     switch_context(&mut prev.context, &next.context);
 }
 
+/// # Safety
+/// Must be called during boot initialization to set initial task ID.
 pub unsafe fn set_current_task(id: u64) {
     CURRENT_TASK_ID = Some(id);
 }
+
 
 core::arch::global_asm!(
     ".global switch_context",
