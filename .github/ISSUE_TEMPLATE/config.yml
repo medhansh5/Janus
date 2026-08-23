@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerabilities
+    url: https://github.com/ashcresthq/janus/blob/main/SECURITY.md
+    about: Please report security vulnerabilities privately via SECURITY.md policy.
+  - name: Architecture Discussions
+    url: https://github.com/ashcresthq/janus/discussions
+    about: Join the architectural discussions on GitHub Discussions.

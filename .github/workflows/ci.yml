@@ -11,29 +11,52 @@ permissions:
 
 jobs:
   rust:
-    name: Rust
+    name: Code Formatting & Static Analysis
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rustfmt
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none, x86_64-unknown-uefi
 
-      - name: Check formatting
+      - name: Check Formatting
         run: cargo fmt --all -- --check
 
-      - name: Host Checks
+      - name: Run Clippy Linter (Host Crates)
         run: |
-          cargo +nightly check -p boot-info
-          cargo +nightly check -p kernel --lib
-          cargo +nightly test -p boot-info
-          cargo +nightly test -p kernel --lib
+          cargo clippy -p boot-info -- -D warnings
+          cargo clippy -p kernel --lib -- -D warnings
 
-      - name: Bare-Metal Checks
+  build-and-test:
+    name: Target Builds & Host Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none, x86_64-unknown-uefi
+
+      - name: Host Unit Tests
         run: |
-          cargo +nightly build -p kernel --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc
-          cargo +nightly build -p bootloader --target x86_64-unknown-uefi -Zbuild-std=core,compiler_builtins,alloc
+          cargo check -p boot-info
+          cargo check -p kernel --lib
+          cargo test -p boot-info
+          cargo test -p kernel --lib
+
+      - name: Kernel Target Build (x86_64-unknown-none)
+        run: |
+          cargo build -p kernel --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc
+
+      - name: Bootloader Target Build (x86_64-unknown-uefi)
+        run: |
+          cargo build -p bootloader --target x86_64-unknown-uefi -Zbuild-std=core,compiler_builtins,alloc

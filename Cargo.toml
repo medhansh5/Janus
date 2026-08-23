@@ -8,8 +8,20 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0"
+authors = ["AshcrestHQ <contact@ashcrest.org>"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ashcresthq/janus"
+homepage = "https://github.com/ashcresthq/janus"
+description = "A security-first microkernel operating system built in Rust with kernel-enforced capability-based access control."
+keywords = ["rust", "osdev", "operating-system", "microkernel", "security"]
+categories = ["embedded", "no-std", "operating-systems"]
+
 [profile.dev]
 panic = "immediate-abort"
 
 [profile.release]
 panic = "immediate-abort"
+
