@@ -1,6 +1,6 @@
 # Janus OS
 
-[![CI](https://github.com/ashcresthq/janus/actions/workflows/ci.yml/badge.svg)](https://github.com/ashcresthq/janus/actions/workflows/ci.yml)
+[![CI-badge](https://github.com/ashcresthq/janus/actions/workflows/ci.yml/badge.svg)](https://github.com/ashcresthq/janus/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT_or_Apache--2.0-blue.svg)](LICENSE)
 
 **Janus** is a security-first microkernel operating system written in Rust, built around kernel-enforced capabilities and zero ambient authority. All resource access requires explicit, unforgeable capability handles managed strictly by the microkernel.
