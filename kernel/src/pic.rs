@@ -95,4 +95,3 @@ pub unsafe fn mask(irq: u8) {
     let value = inb(port) | (1 << (irq % 8));
     outb(port, value);
 }
-

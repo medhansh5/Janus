@@ -81,4 +81,3 @@ pub unsafe fn set_kernel_stack(rsp0: u64) {
         tss_mut.privilege_stack_table[0] = VirtAddr::new(rsp0);
     }
 }
-

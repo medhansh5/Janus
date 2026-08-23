@@ -31,8 +31,8 @@ pub unsafe fn inw(port: u16) -> u16 {
     ret
 }
 
-
 pub fn read_config(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
+
     let address = 0x80000000
         | ((bus as u32) << 16)
         | ((slot as u32) << 11)

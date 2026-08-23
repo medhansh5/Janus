@@ -185,8 +185,8 @@ pub unsafe fn set_current_task(id: u64) {
     CURRENT_TASK_ID = Some(id);
 }
 
-
 core::arch::global_asm!(
+
     ".global switch_context",
     "switch_context:",
     // rdi = *mut TaskContext (prev)

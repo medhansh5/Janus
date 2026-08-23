@@ -242,8 +242,8 @@ pub unsafe extern "C" fn exception_handler(frame: *const ExceptionFrame) {
         serial.write_hex(irq_num);
         serial.write_str("\n");
 
-
         unsafe {
+
             crate::pic::end_of_interrupt(irq_num as u8);
         }
 

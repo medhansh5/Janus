@@ -10,8 +10,8 @@ pub const PHYS_MEMORY_OFFSET: u64 = 0xFFFF900000000000;
 /// # Safety
 /// Must be called with valid identity-mapped memory provided by the bootloader.
 pub unsafe fn init_root_page_table(allocator: &mut PhysFrameAllocator) {
-
     // Read current CR3 to get the active PML4 (provided by bootloader/UEFI)
+
     let cr3_frame = x86_64::registers::control::Cr3::read().0;
     let old_pml4_ptr = cr3_frame.start_address().as_u64() as *const PageTable;
     let old_pml4 = &*old_pml4_ptr;
@@ -98,8 +98,8 @@ pub unsafe fn unmap_lower_half_and_switch_stack(
     new_rsp: u64,
     stage2: extern "sysv64" fn() -> !,
 ) -> ! {
-
     // 1. Get current PML4 physical address from CR3
+
     let cr3_frame = x86_64::registers::control::Cr3::read().0;
     let pml4_paddr = cr3_frame.start_address().as_u64();
 

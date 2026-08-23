@@ -9,8 +9,8 @@ use x86_64::registers::rflags::RFlags;
 /// # Safety
 /// Must be called after GDT initialization and before executing Ring 3 tasks.
 pub unsafe fn init() {
-
     let selectors = gdt::SELECTORS
+
         .get()
         .expect("GDT must be initialized before syscalls");
     Efer::write(Efer::read() | EferFlags::SYSTEM_CALL_EXTENSIONS);

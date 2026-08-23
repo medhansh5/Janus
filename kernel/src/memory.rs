@@ -23,8 +23,8 @@ impl FrameAllocator {
         }
     }
 
-
     pub fn set_phys_offset(&mut self, offset: u64) {
+
         self.phys_offset = offset;
     }
 

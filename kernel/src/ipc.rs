@@ -173,7 +173,6 @@ fn sys_recv(endpoint_cptr: CPtr, _msg_ptr: u64) -> u64 {
 
         msg
     } else {
-
         let receiver = unsafe { crate::task::current_task_mut().unwrap() };
         receiver.state = TaskState::BlockedOnRecv {
             endpoint: endpoint_cptr,
