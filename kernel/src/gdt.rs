@@ -1,12 +1,40 @@
+use core::cell::UnsafeCell;
+use spin::Once;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
-use spin::Once;
-
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
-static TSS: Once<TaskStateSegment> = Once::new();
+// Dedicated, 16-byte aligned double-fault stack (4KB).
+// Placed statically in .bss so it is permanently mapped and accessible
+// even if the active kernel stack overflows or becomes unmapped.
+#[repr(align(16))]
+struct DoubleFaultStack {
+    _storage: [u8; 4096],
+}
+static mut DOUBLE_FAULT_STACK: DoubleFaultStack = DoubleFaultStack {
+    _storage: [0; 4096],
+};
+
+/// Encapsulated, sound interior-mutability wrapper for the Task State Segment.
+///
+/// # Soundness Invariants:
+/// 1. Janus is a uniprocessor x86_64 microkernel (`LIMITATIONS.md`). Exactly one CPU core
+///    executes kernel code and accesses this TSS.
+/// 2. Hardware accesses to the TSS occur via MMU reads during privilege-level transitions
+///    (Ring 3 -> 0 reading RSP0) and IST lookups.
+/// 3. Software access is strictly limited to single-threaded boot initialization (`init`)
+///    and atomic 64-bit writes of `privilege_stack_table[0]` during task switches (`set_kernel_stack`).
+/// 4. No shared or mutable Rust references (`&TaskStateSegment` or `&mut TaskStateSegment`)
+///    persist past initialization. All runtime updates write directly through the raw pointer
+///    obtained from `UnsafeCell::get()`, completely avoiding mutable transmutes of immutable borrows.
+#[repr(transparent)]
+struct KernelTss(UnsafeCell<TaskStateSegment>);
+
+unsafe impl Sync for KernelTss {}
+
+static TSS: KernelTss = KernelTss(UnsafeCell::new(TaskStateSegment::new()));
 static GDT: Once<GlobalDescriptorTable> = Once::new();
 
 #[derive(Clone, Copy)]
@@ -25,10 +53,19 @@ pub static SELECTORS: Once<Selectors> = Once::new();
 /// # Safety
 /// Must be called during single-threaded kernel boot before ring transitions or syscall setup.
 pub unsafe fn init() {
-    let mut tss = TaskStateSegment::new();
+    let tss_ptr = TSS.0.get();
+
     // Set up a basic TSS (useful later for interrupts and syscall ring transitions)
     // For syscalls, the CPU needs RSP0 from the TSS when transitioning Ring 3 -> Ring 0.
-    tss.privilege_stack_table[0] = VirtAddr::new(0); // We'll update this on task switch
+    (*tss_ptr).privilege_stack_table[0] = VirtAddr::new(0); // We'll update this on task switch
+
+    // Configure the dedicated Double Fault stack in the IST
+    let stack_top = VirtAddr::from_ptr(
+        core::ptr::addr_of!(DOUBLE_FAULT_STACK)
+            .cast::<u8>()
+            .add(4096),
+    );
+    (*tss_ptr).interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_top;
 
     let mut gdt = GlobalDescriptorTable::new();
 
@@ -38,7 +75,9 @@ pub unsafe fn init() {
     let user_data = gdt.append(Descriptor::user_data_segment());
     let user_code = gdt.append(Descriptor::user_code_segment());
 
-    let tss_ref = TSS.call_once(|| tss);
+    // Descriptor::tss_segment extracts the pointer base and limit to encode
+    // into the 16-byte system segment descriptor in the GDT.
+    let tss_ref: &'static TaskStateSegment = &*tss_ptr;
     let tss_selector = gdt.append(Descriptor::tss_segment(tss_ref));
 
     let gdt_ref = GDT.call_once(|| gdt);
@@ -74,10 +113,8 @@ pub unsafe fn init() {
 /// # Safety
 /// `rsp0` must point to a valid, aligned kernel stack boundary.
 pub unsafe fn set_kernel_stack(rsp0: u64) {
-    if let Some(tss) = TSS.get() {
-        // Safe because the TSS is only read/written from a single core
-        #[allow(mutable_transmutes)]
-        let tss_mut: &mut TaskStateSegment = core::mem::transmute(tss);
-        tss_mut.privilege_stack_table[0] = VirtAddr::new(rsp0);
-    }
+    let tss_ptr = TSS.0.get();
+    // In x86_64 uniprocessor, this is an atomic 64-bit aligned store.
+    // We write directly through raw pointer with no long-lived borrows.
+    (*tss_ptr).privilege_stack_table[0] = VirtAddr::new(rsp0);
 }

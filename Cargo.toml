@@ -22,6 +22,9 @@ categories = ["embedded", "no-std", "operating-systems"]
 [profile.dev]
 panic = "immediate-abort"
 
+[profile.dev.package.compiler_builtins]
+opt-level = "s"
+
 [profile.release]
 panic = "immediate-abort"
 

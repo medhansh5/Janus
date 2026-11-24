@@ -32,6 +32,13 @@ impl IdtEntry {
         self.offset_high = (handler >> 32) as u32;
         self.reserved = 0;
     }
+
+    pub fn set_handler_fn_ist(&mut self, handler: u64, ist_index: u16) {
+        self.set_handler_fn(handler);
+        // IST index is 1-based in IDT options (bits 0..2).
+        // Array index 0 in TSS corresponds to IST value 1 in the IDT gate.
+        self.options = 0x8E00 | (ist_index + 1);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +53,7 @@ static mut IDT: [IdtEntry; 256] = [IdtEntry::empty(); 256];
 static mut IDT_PTR: IdtPtr = IdtPtr { limit: 0, base: 0 };
 
 extern "C" {
+    fn double_fault_stub();
     fn general_protection_fault_stub();
     fn page_fault_stub();
     fn timer_stub();
@@ -58,6 +66,10 @@ extern "C" {
 pub fn init() {
     unsafe {
         // Initialize common exception handlers
+        IDT[8].set_handler_fn_ist(
+            double_fault_stub as *const () as usize as u64,
+            gdt::DOUBLE_FAULT_IST_INDEX,
+        ); // #DF (Double Fault)
         IDT[13].set_handler_fn(general_protection_fault_stub as *const () as usize as u64); // #GP
         IDT[14].set_handler_fn(page_fault_stub as *const () as usize as u64); // #PF
 
@@ -80,6 +92,15 @@ pub fn init() {
 // Exception assembly stubs that push error codes and call Rust handlers.
 // The CPU pushes: SS, RSP, RFLAGS, CS, RIP, (ErrorCode - for some exceptions).
 // #GP (13) and #PF (14) push an error code.
+// #DF (8) also pushes a hardware error code (value is always 0).
+
+core::arch::global_asm!(
+    ".global double_fault_stub",
+    "double_fault_stub:",
+    // Hardware already pushed error code (0) for #DF
+    "push 8", // Push vector number
+    "jmp exception_common"
+);
 
 core::arch::global_asm!(
     ".global general_protection_fault_stub",
@@ -259,6 +280,12 @@ pub unsafe extern "C" fn exception_handler(frame: *const ExceptionFrame) {
     serial.write_str(" (Error Code: ");
     serial.write_hex(frame.error_code);
     serial.write_str(")\n");
+
+    if frame.vector == 8 {
+        serial.write_str(
+            "[KERNEL PANIC] Double Fault (#DF) triggered! Dedicated IST stack active.\n",
+        );
+    }
 
     if frame.vector == 14 {
         let cr2: u64;

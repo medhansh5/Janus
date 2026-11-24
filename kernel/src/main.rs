@@ -520,7 +520,14 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
     }
     task_idle.context.rsp = task_idle_kstack_top - 8;
     task_idle.context.rdi = idle_task_payload as *const () as u64;
-    task_idle.context.rsi = task_idle_kstack_top - 4096; // Kernel stack for interrupts
+    // The initial kernel stack pointer for the idle task payload.
+    // When scheduled, switch_context returns to jump_to_kernel_trampoline via context.rsp [top - 8].
+    // jump_to_kernel_trampoline then calls jump_to_kernel_task(rdi, rsi), which executes iretq,
+    // popping context.rsi into the hardware RSP register.
+    // Setting RSI to (top - 4096) placed RSP at the bottom of the allocated stack page,
+    // causing immediate stack underflow into unallocated memory on the very first interrupt push.
+    // We set RSI to (top - 16) to provide a 16-byte aligned stack top with full headroom.
+    task_idle.context.rsi = task_idle_kstack_top - 16;
 
     unsafe {
         serial.write_str("[KERNEL] Context configured. Dropping to Ring 3 (Task A)...\n");
