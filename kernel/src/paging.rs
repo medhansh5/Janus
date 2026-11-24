@@ -1,9 +1,21 @@
 use crate::memory::FrameAllocator as PhysFrameAllocator;
+use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
 use x86_64::{PhysAddr, VirtAddr};
 
 pub const PHYS_MEMORY_OFFSET: u64 = 0xFFFF900000000000;
+
+/// Authoritative physical address of the master kernel root page table (PML4).
+///
+/// Established once during boot initialization by `init_root_page_table`.
+/// This address is permanent and strictly distinct from the dynamic CPU CR3 register contents.
+static KERNEL_PML4_PADDR: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the authoritative physical address of the master kernel root page table (PML4).
+pub fn kernel_pml4_paddr() -> u64 {
+    KERNEL_PML4_PADDR.load(Ordering::Acquire)
+}
 
 /// Initializes the root page table (PML4) and maps physical memory.
 ///
@@ -80,6 +92,11 @@ pub unsafe fn init_root_page_table(allocator: &mut PhysFrameAllocator) {
         new_cr3_frame,
         x86_64::registers::control::Cr3Flags::empty(),
     );
+
+    // Establish authoritative master kernel PML4 physical address.
+    // Atomic compare_exchange ensures initialization happens once during boot and cannot be overwritten.
+    let _ =
+        KERNEL_PML4_PADDR.compare_exchange(0, new_pml4_paddr, Ordering::Release, Ordering::Relaxed);
 
     // Update allocator offset now that mapping is active
     allocator.set_phys_offset(PHYS_MEMORY_OFFSET);
@@ -452,7 +469,654 @@ pub fn copy_user_u32(user_vaddr: u64) -> Result<u32, UserCopyError> {
     Ok(u32::from_ne_bytes(bytes))
 }
 
+/// Errors that can occur during dynamic user address-space page mapping and management.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagingError {
+    /// Physical frame allocator ran out of memory.
+    OutOfMemory,
+    /// Requested virtual address violates kernel higher-half boundary (PML4 index >= 256).
+    KernelAddressViolation,
+    /// Address is non-canonical or outside the valid lower-half user address space.
+    NonCanonicalAddress,
+    /// Virtual or physical address is not 4 KiB aligned.
+    MisalignedAddress,
+    /// Physical address exceeds the direct-mapped memory window (DIRECT_MAP_LIMIT).
+    PhysicalAddressOutOfBounds,
+    /// Target virtual page is already mapped in the page table.
+    AlreadyMapped,
+    /// Target virtual page is not mapped.
+    NotMapped,
+    /// Page table flags violate W^X policy (page is WRITABLE without NO_EXECUTE).
+    WxViolation,
+    /// A page table entry contains reserved bits or huge-page flags where unpermitted.
+    InvalidPageTableEntry,
+    /// A user mapping request lacks USER_ACCESSIBLE permission.
+    SupervisorOnly,
+}
+
+/// Abstract frame allocator interface to enable mock testing with failure injection.
+pub trait FrameAllocatorTrait {
+    fn allocate_frame(&mut self) -> Option<u64>;
+    fn free_frame(&mut self, paddr: u64);
+}
+
+impl FrameAllocatorTrait for PhysFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<u64> {
+        self.allocate_frame()
+    }
+    fn free_frame(&mut self, paddr: u64) {
+        self.free_frame(paddr);
+    }
+}
+
+/// Abstract interface for accessing, zeroing, and invalidating physical page tables.
+pub(crate) trait PageTableAccessor {
+    /// Obtains a mutable reference to the `PageTable` located at physical address `paddr`.
+    ///
+    /// # Safety
+    /// Caller must ensure `paddr` is 4 KiB aligned and represents a valid page table frame.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get_table_mut(&self, paddr: u64) -> Result<&mut PageTable, PagingError>;
+
+    /// Zeroes an entire 4096-byte frame at physical address `paddr`.
+    ///
+    /// # Safety
+    /// Caller must ensure `paddr` is 4 KiB aligned and represents a valid physical frame.
+    unsafe fn zero_frame(&self, paddr: u64) -> Result<(), PagingError>;
+
+    /// Returns the authoritative physical address of the master kernel root page table (PML4).
+    fn kernel_root_pml4(&self) -> u64;
+
+    /// Returns the physical address of the currently active root page table loaded in CPU CR3.
+    fn active_pml4(&self) -> u64;
+
+    /// Flushes TLB for a virtual address if the specified `pml4_paddr` is active.
+    fn flush_tlb_if_active(&self, pml4_paddr: u64, vaddr: u64);
+}
+
+/// Production accessor operating on the direct physical map (`PHYS_MEMORY_OFFSET`).
+pub(crate) struct DirectMapAccessor;
+
+impl PageTableAccessor for DirectMapAccessor {
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get_table_mut(&self, paddr: u64) -> Result<&mut PageTable, PagingError> {
+        if (paddr & 0xFFF) != 0 {
+            return Err(PagingError::MisalignedAddress);
+        }
+        let end_paddr = paddr
+            .checked_add(4096)
+            .ok_or(PagingError::PhysicalAddressOutOfBounds)?;
+        if end_paddr > DIRECT_MAP_LIMIT {
+            return Err(PagingError::PhysicalAddressOutOfBounds);
+        }
+        let vaddr = paddr
+            .checked_add(PHYS_MEMORY_OFFSET)
+            .ok_or(PagingError::PhysicalAddressOutOfBounds)?;
+        Ok(&mut *(vaddr as *mut PageTable))
+    }
+
+    unsafe fn zero_frame(&self, paddr: u64) -> Result<(), PagingError> {
+        if (paddr & 0xFFF) != 0 {
+            return Err(PagingError::MisalignedAddress);
+        }
+        let end_paddr = paddr
+            .checked_add(4096)
+            .ok_or(PagingError::PhysicalAddressOutOfBounds)?;
+        if end_paddr > DIRECT_MAP_LIMIT {
+            return Err(PagingError::PhysicalAddressOutOfBounds);
+        }
+        let vaddr = paddr
+            .checked_add(PHYS_MEMORY_OFFSET)
+            .ok_or(PagingError::PhysicalAddressOutOfBounds)?;
+        core::ptr::write_bytes(vaddr as *mut u8, 0, 4096);
+        Ok(())
+    }
+
+    fn kernel_root_pml4(&self) -> u64 {
+        kernel_pml4_paddr()
+    }
+
+    fn active_pml4(&self) -> u64 {
+        #[cfg(all(target_arch = "x86_64", not(test)))]
+        {
+            x86_64::registers::control::Cr3::read()
+                .0
+                .start_address()
+                .as_u64()
+        }
+        #[cfg(any(not(target_arch = "x86_64"), test))]
+        {
+            0
+        }
+    }
+
+    fn flush_tlb_if_active(&self, pml4_paddr: u64, vaddr: u64) {
+        #[cfg(all(target_arch = "x86_64", not(test)))]
+        {
+            let cr3_frame = x86_64::registers::control::Cr3::read().0;
+            if cr3_frame.start_address().as_u64() == pml4_paddr {
+                x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+            }
+        }
+        #[cfg(any(not(target_arch = "x86_64"), test))]
+        {
+            let _ = (pml4_paddr, vaddr);
+        }
+    }
+}
+
+/// Creates a new user address space (PML4) by copying kernel higher-half mappings.
+///
+/// Allocates a new 4 KiB frame for the PML4, zeroes the lower-half entries (0..256),
+/// and shallow-copies higher-half entries (256..512) from the active kernel page table.
+pub fn create_user_pml4(allocator: &mut PhysFrameAllocator) -> Result<u64, PagingError> {
+    let accessor = DirectMapAccessor;
+    create_user_pml4_inner(allocator, &accessor)
+}
+
+/// Maps a 4 KiB physical leaf frame into a user address space.
+///
+/// Enforces canonical user bounds, 4 KiB alignment, direct-map bounds, and W^X policy.
+/// Intermediate page tables (PDPT, PD, PT) are allocated and zeroed on demand.
+/// If an allocation failure occurs midway, all intermediate tables allocated during
+/// this call are rolled back cleanly.
+pub fn map_user_page(
+    pml4_paddr: u64,
+    vaddr: u64,
+    paddr: u64,
+    flags: PageTableFlags,
+    allocator: &mut PhysFrameAllocator,
+) -> Result<(), PagingError> {
+    let accessor = DirectMapAccessor;
+    map_user_page_inner(pml4_paddr, vaddr, paddr, flags, allocator, &accessor)
+}
+
+/// Unmaps a 4 KiB virtual page from a user address space.
+///
+/// Removes the leaf PT mapping, invalidates the TLB if the target PML4 is currently active,
+/// and reclaims newly empty intermediate page tables.
+/// Returns the physical address of the unmapped leaf frame without freeing it.
+pub fn unmap_user_page(
+    pml4_paddr: u64,
+    vaddr: u64,
+    allocator: &mut PhysFrameAllocator,
+) -> Result<u64, PagingError> {
+    let accessor = DirectMapAccessor;
+    unmap_user_page_inner(pml4_paddr, vaddr, allocator, &accessor)
+}
+
+/// Destroys a user address space, reclaiming all user-space intermediate page tables.
+///
+/// Traverses only lower-half PML4 entries (0..256). Shared higher-half kernel entries
+/// (256..512) and leaf data frames are NEVER modified or freed.
+///
+/// # Root Protection Policy
+/// This function refuses to destroy and safely ignores attempts to destroy:
+/// 1. The authoritative master kernel root PML4 (`kernel_pml4_paddr()`), regardless of what is loaded in CR3.
+/// 2. The currently active root PML4 loaded in the CPU CR3 register.
+pub fn destroy_user_pml4(pml4_paddr: u64, allocator: &mut PhysFrameAllocator) {
+    let accessor = DirectMapAccessor;
+    destroy_user_pml4_inner(pml4_paddr, allocator, &accessor);
+}
+
+pub(crate) fn create_user_pml4_inner<A: FrameAllocatorTrait, M: PageTableAccessor>(
+    allocator: &mut A,
+    accessor: &M,
+) -> Result<u64, PagingError> {
+    let pml4_paddr = allocator.allocate_frame().ok_or(PagingError::OutOfMemory)?;
+    if let Err(e) = unsafe { accessor.zero_frame(pml4_paddr) } {
+        allocator.free_frame(pml4_paddr);
+        return Err(e);
+    }
+
+    let kernel_pml4_paddr = accessor.kernel_root_pml4();
+    if kernel_pml4_paddr != 0 {
+        let mut higher_half = [const { PageTableEntry::new() }; 256];
+        {
+            let kernel_pml4 = match unsafe { accessor.get_table_mut(kernel_pml4_paddr) } {
+                Ok(t) => t,
+                Err(e) => {
+                    allocator.free_frame(pml4_paddr);
+                    return Err(e);
+                }
+            };
+            for i in 256..512 {
+                higher_half[i - 256] = kernel_pml4[i].clone();
+            }
+        }
+        let new_pml4 = match unsafe { accessor.get_table_mut(pml4_paddr) } {
+            Ok(t) => t,
+            Err(e) => {
+                allocator.free_frame(pml4_paddr);
+                return Err(e);
+            }
+        };
+        for i in 256..512 {
+            new_pml4[i] = higher_half[i - 256].clone();
+        }
+    }
+
+    Ok(pml4_paddr)
+}
+
+pub(crate) fn map_user_page_inner<A: FrameAllocatorTrait, M: PageTableAccessor>(
+    pml4_paddr: u64,
+    vaddr: u64,
+    paddr: u64,
+    flags: PageTableFlags,
+    allocator: &mut A,
+    accessor: &M,
+) -> Result<(), PagingError> {
+    // 1. Virtual address bounds & canonical validation
+    if vaddr >= KERNEL_SPACE_START {
+        return Err(PagingError::KernelAddressViolation);
+    }
+    if vaddr >= USER_SPACE_END {
+        return Err(PagingError::NonCanonicalAddress);
+    }
+    if (vaddr & 0xFFF) != 0 {
+        return Err(PagingError::MisalignedAddress);
+    }
+    let virt_addr = VirtAddr::new(vaddr);
+    let p4_idx = virt_addr.p4_index();
+    if u16::from(p4_idx) >= 256 {
+        return Err(PagingError::KernelAddressViolation);
+    }
+
+    // 2. Physical address bounds & alignment validation
+    if (paddr & 0xFFF) != 0 {
+        return Err(PagingError::MisalignedAddress);
+    }
+    let end_paddr = paddr
+        .checked_add(4096)
+        .ok_or(PagingError::PhysicalAddressOutOfBounds)?;
+    if end_paddr > DIRECT_MAP_LIMIT {
+        return Err(PagingError::PhysicalAddressOutOfBounds);
+    }
+
+    // 3. Flags validation & W^X enforcement
+    if !flags.contains(PageTableFlags::PRESENT) || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+    {
+        return Err(PagingError::SupervisorOnly);
+    }
+    if flags.contains(PageTableFlags::HUGE_PAGE) {
+        return Err(PagingError::InvalidPageTableEntry);
+    }
+    if flags.contains(PageTableFlags::WRITABLE) && !flags.contains(PageTableFlags::NO_EXECUTE) {
+        return Err(PagingError::WxViolation);
+    }
+
+    let p3_idx = virt_addr.p3_index();
+    let p2_idx = virt_addr.p2_index();
+    let p1_idx = virt_addr.p1_index();
+
+    let mut alloc_pdpt: Option<u64> = None;
+    let mut alloc_pd: Option<u64> = None;
+    let mut alloc_pt: Option<u64> = None;
+
+    // Traverse / allocate Level 4 -> PDPT
+    let pml4 = unsafe { accessor.get_table_mut(pml4_paddr)? };
+    let pdpt_paddr = if pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+        if pml4[p4_idx].flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Err(PagingError::InvalidPageTableEntry);
+        }
+        pml4[p4_idx].addr().as_u64()
+    } else {
+        let frame = allocator.allocate_frame().ok_or(PagingError::OutOfMemory)?;
+        if let Err(e) = unsafe { accessor.zero_frame(frame) } {
+            allocator.free_frame(frame);
+            return Err(e);
+        }
+        pml4[p4_idx].set_addr(
+            PhysAddr::new(frame),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+        );
+        alloc_pdpt = Some(frame);
+        frame
+    };
+
+    // Traverse / allocate Level 3 -> PD
+    let pdpt = match unsafe { accessor.get_table_mut(pdpt_paddr) } {
+        Ok(t) => t,
+        Err(e) => {
+            if let Some(f_pdpt) = alloc_pdpt {
+                let pml4 = unsafe { accessor.get_table_mut(pml4_paddr).unwrap() };
+                pml4[p4_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pdpt);
+            }
+            return Err(e);
+        }
+    };
+    let pd_paddr = if pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
+        if pdpt[p3_idx].flags().contains(PageTableFlags::HUGE_PAGE) {
+            if let Some(f_pdpt) = alloc_pdpt {
+                let pml4 = unsafe { accessor.get_table_mut(pml4_paddr).unwrap() };
+                pml4[p4_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pdpt);
+            }
+            return Err(PagingError::InvalidPageTableEntry);
+        }
+        pdpt[p3_idx].addr().as_u64()
+    } else {
+        let frame = match allocator.allocate_frame() {
+            Some(f) => f,
+            None => {
+                if let Some(f_pdpt) = alloc_pdpt {
+                    let pml4 = unsafe { accessor.get_table_mut(pml4_paddr).unwrap() };
+                    pml4[p4_idx] = PageTableEntry::new();
+                    allocator.free_frame(f_pdpt);
+                }
+                return Err(PagingError::OutOfMemory);
+            }
+        };
+        if let Err(e) = unsafe { accessor.zero_frame(frame) } {
+            allocator.free_frame(frame);
+            if let Some(f_pdpt) = alloc_pdpt {
+                let pml4 = unsafe { accessor.get_table_mut(pml4_paddr).unwrap() };
+                pml4[p4_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pdpt);
+            }
+            return Err(e);
+        }
+        pdpt[p3_idx].set_addr(
+            PhysAddr::new(frame),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+        );
+        alloc_pd = Some(frame);
+        frame
+    };
+
+    // Traverse / allocate Level 2 -> PT
+    let pd = match unsafe { accessor.get_table_mut(pd_paddr) } {
+        Ok(t) => t,
+        Err(e) => {
+            if let Some(f_pd) = alloc_pd {
+                let pdpt = unsafe { accessor.get_table_mut(pdpt_paddr).unwrap() };
+                pdpt[p3_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pd);
+            }
+            if let Some(f_pdpt) = alloc_pdpt {
+                let pml4 = unsafe { accessor.get_table_mut(pml4_paddr).unwrap() };
+                pml4[p4_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pdpt);
+            }
+            return Err(e);
+        }
+    };
+    let pt_paddr = if pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
+        if pd[p2_idx].flags().contains(PageTableFlags::HUGE_PAGE) {
+            if let Some(f_pd) = alloc_pd {
+                let pdpt = unsafe { accessor.get_table_mut(pdpt_paddr).unwrap() };
+                pdpt[p3_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pd);
+            }
+            if let Some(f_pdpt) = alloc_pdpt {
+                let pml4 = unsafe { accessor.get_table_mut(pml4_paddr).unwrap() };
+                pml4[p4_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pdpt);
+            }
+            return Err(PagingError::InvalidPageTableEntry);
+        }
+        pd[p2_idx].addr().as_u64()
+    } else {
+        let frame = match allocator.allocate_frame() {
+            Some(f) => f,
+            None => {
+                if let Some(f_pd) = alloc_pd {
+                    let pdpt = unsafe { accessor.get_table_mut(pdpt_paddr).unwrap() };
+                    pdpt[p3_idx] = PageTableEntry::new();
+                    allocator.free_frame(f_pd);
+                }
+                if let Some(f_pdpt) = alloc_pdpt {
+                    let pml4 = unsafe { accessor.get_table_mut(pml4_paddr).unwrap() };
+                    pml4[p4_idx] = PageTableEntry::new();
+                    allocator.free_frame(f_pdpt);
+                }
+                return Err(PagingError::OutOfMemory);
+            }
+        };
+        if let Err(e) = unsafe { accessor.zero_frame(frame) } {
+            allocator.free_frame(frame);
+            if let Some(f_pd) = alloc_pd {
+                let pdpt = unsafe { accessor.get_table_mut(pdpt_paddr).unwrap() };
+                pdpt[p3_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pd);
+            }
+            if let Some(f_pdpt) = alloc_pdpt {
+                let pml4 = unsafe { accessor.get_table_mut(pml4_paddr).unwrap() };
+                pml4[p4_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pdpt);
+            }
+            return Err(e);
+        }
+        pd[p2_idx].set_addr(
+            PhysAddr::new(frame),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+        );
+        alloc_pt = Some(frame);
+        frame
+    };
+
+    // Traverse Level 1 -> Leaf PT entry
+    let pt = match unsafe { accessor.get_table_mut(pt_paddr) } {
+        Ok(t) => t,
+        Err(e) => {
+            if let Some(f_pt) = alloc_pt {
+                let pd = unsafe { accessor.get_table_mut(pd_paddr).unwrap() };
+                pd[p2_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pt);
+            }
+            if let Some(f_pd) = alloc_pd {
+                let pdpt = unsafe { accessor.get_table_mut(pdpt_paddr).unwrap() };
+                pdpt[p3_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pd);
+            }
+            if let Some(f_pdpt) = alloc_pdpt {
+                let pml4 = unsafe { accessor.get_table_mut(pml4_paddr).unwrap() };
+                pml4[p4_idx] = PageTableEntry::new();
+                allocator.free_frame(f_pdpt);
+            }
+            return Err(e);
+        }
+    };
+
+    if pt[p1_idx].flags().contains(PageTableFlags::PRESENT) {
+        // Already mapped: roll back newly allocated tables
+        if let Some(f_pt) = alloc_pt {
+            let pd = unsafe { accessor.get_table_mut(pd_paddr).unwrap() };
+            pd[p2_idx] = PageTableEntry::new();
+            allocator.free_frame(f_pt);
+        }
+        if let Some(f_pd) = alloc_pd {
+            let pdpt = unsafe { accessor.get_table_mut(pdpt_paddr).unwrap() };
+            pdpt[p3_idx] = PageTableEntry::new();
+            allocator.free_frame(f_pd);
+        }
+        if let Some(f_pdpt) = alloc_pdpt {
+            let pml4 = unsafe { accessor.get_table_mut(pml4_paddr).unwrap() };
+            pml4[p4_idx] = PageTableEntry::new();
+            allocator.free_frame(f_pdpt);
+        }
+        return Err(PagingError::AlreadyMapped);
+    }
+
+    // Commit leaf mapping
+    pt[p1_idx].set_addr(PhysAddr::new(paddr), flags);
+    accessor.flush_tlb_if_active(pml4_paddr, vaddr);
+    Ok(())
+}
+
+pub(crate) fn unmap_user_page_inner<A: FrameAllocatorTrait, M: PageTableAccessor>(
+    pml4_paddr: u64,
+    vaddr: u64,
+    allocator: &mut A,
+    accessor: &M,
+) -> Result<u64, PagingError> {
+    if vaddr >= KERNEL_SPACE_START {
+        return Err(PagingError::KernelAddressViolation);
+    }
+    if vaddr >= USER_SPACE_END {
+        return Err(PagingError::NonCanonicalAddress);
+    }
+    if (vaddr & 0xFFF) != 0 {
+        return Err(PagingError::MisalignedAddress);
+    }
+    let virt_addr = VirtAddr::new(vaddr);
+    let p4_idx = virt_addr.p4_index();
+    if u16::from(p4_idx) >= 256 {
+        return Err(PagingError::KernelAddressViolation);
+    }
+
+    let p3_idx = virt_addr.p3_index();
+    let p2_idx = virt_addr.p2_index();
+    let p1_idx = virt_addr.p1_index();
+
+    let pml4 = unsafe { accessor.get_table_mut(pml4_paddr)? };
+    if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+        return Err(PagingError::NotMapped);
+    }
+    if pml4[p4_idx].flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Err(PagingError::InvalidPageTableEntry);
+    }
+    let pdpt_paddr = pml4[p4_idx].addr().as_u64();
+
+    let pdpt = unsafe { accessor.get_table_mut(pdpt_paddr)? };
+    if !pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
+        return Err(PagingError::NotMapped);
+    }
+    if pdpt[p3_idx].flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Err(PagingError::InvalidPageTableEntry);
+    }
+    let pd_paddr = pdpt[p3_idx].addr().as_u64();
+
+    let pd = unsafe { accessor.get_table_mut(pd_paddr)? };
+    if !pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
+        return Err(PagingError::NotMapped);
+    }
+    if pd[p2_idx].flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Err(PagingError::InvalidPageTableEntry);
+    }
+    let pt_paddr = pd[p2_idx].addr().as_u64();
+
+    let pt = unsafe { accessor.get_table_mut(pt_paddr)? };
+    if !pt[p1_idx].flags().contains(PageTableFlags::PRESENT) {
+        return Err(PagingError::NotMapped);
+    }
+
+    let leaf_paddr = pt[p1_idx].addr().as_u64();
+    pt[p1_idx] = PageTableEntry::new();
+
+    // TLB invalidation if active
+    accessor.flush_tlb_if_active(pml4_paddr, vaddr);
+
+    // Intermediate table reclamation when empty
+    let mut pt_empty = true;
+    for i in 0..512 {
+        if pt[i].flags().contains(PageTableFlags::PRESENT) {
+            pt_empty = false;
+            break;
+        }
+    }
+    if pt_empty {
+        let pd = unsafe { accessor.get_table_mut(pd_paddr)? };
+        pd[p2_idx] = PageTableEntry::new();
+        allocator.free_frame(pt_paddr);
+
+        let mut pd_empty = true;
+        for i in 0..512 {
+            if pd[i].flags().contains(PageTableFlags::PRESENT) {
+                pd_empty = false;
+                break;
+            }
+        }
+        if pd_empty {
+            let pdpt = unsafe { accessor.get_table_mut(pdpt_paddr)? };
+            pdpt[p3_idx] = PageTableEntry::new();
+            allocator.free_frame(pd_paddr);
+
+            let mut pdpt_empty = true;
+            for i in 0..512 {
+                if pdpt[i].flags().contains(PageTableFlags::PRESENT) {
+                    pdpt_empty = false;
+                    break;
+                }
+            }
+            if pdpt_empty {
+                let pml4 = unsafe { accessor.get_table_mut(pml4_paddr)? };
+                pml4[p4_idx] = PageTableEntry::new();
+                allocator.free_frame(pdpt_paddr);
+            }
+        }
+    }
+
+    Ok(leaf_paddr)
+}
+
+pub(crate) fn destroy_user_pml4_inner<A: FrameAllocatorTrait, M: PageTableAccessor>(
+    pml4_paddr: u64,
+    allocator: &mut A,
+    accessor: &M,
+) {
+    // Never allow destroying the permanent authoritative kernel root PML4,
+    // nor the currently active root loaded in CR3.
+    let kernel_root = accessor.kernel_root_pml4();
+    let active_root = accessor.active_pml4();
+    if (kernel_root != 0 && pml4_paddr == kernel_root)
+        || (active_root != 0 && pml4_paddr == active_root)
+    {
+        return;
+    }
+
+    let pml4 = match unsafe { accessor.get_table_mut(pml4_paddr) } {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    // Traverse ONLY user entries 0..256
+    for p4_idx in 0..256 {
+        if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT)
+            || pml4[p4_idx].flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            continue;
+        }
+        let pdpt_paddr = pml4[p4_idx].addr().as_u64();
+        let pdpt = match unsafe { accessor.get_table_mut(pdpt_paddr) } {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        for p3_idx in 0..512 {
+            if !pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT)
+                || pdpt[p3_idx].flags().contains(PageTableFlags::HUGE_PAGE)
+            {
+                continue;
+            }
+            let pd_paddr = pdpt[p3_idx].addr().as_u64();
+            let pd = match unsafe { accessor.get_table_mut(pd_paddr) } {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            for p2_idx in 0..512 {
+                if !pd[p2_idx].flags().contains(PageTableFlags::PRESENT)
+                    || pd[p2_idx].flags().contains(PageTableFlags::HUGE_PAGE)
+                {
+                    continue;
+                }
+                let pt_paddr = pd[p2_idx].addr().as_u64();
+                // PT table frame is freed; leaf frames are NOT freed!
+                allocator.free_frame(pt_paddr);
+            }
+            allocator.free_frame(pd_paddr);
+        }
+        allocator.free_frame(pdpt_paddr);
+    }
+
+    allocator.free_frame(pml4_paddr);
+}
+
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
     use x86_64::structures::paging::PageTableFlags;
@@ -913,5 +1577,849 @@ mod tests {
         let mut buf = [0u8; 4];
         let res = copy_from_user_with_reader(&reader, &pml4, 0x400000, &mut buf);
         assert_eq!(res, Err(UserCopyError::InvalidPageTableEntry));
+    }
+
+    // =========================================================================
+    // Stage 3.0 Unit Test Infrastructure & Acceptance Tests
+    // =========================================================================
+
+    struct MockFrameAllocator {
+        free_frames: [u64; 64],
+        head: usize,
+        freed_frames: [u64; 64],
+        freed_count: usize,
+        fail_after: Option<usize>,
+        alloc_count: usize,
+    }
+
+    impl MockFrameAllocator {
+        fn new() -> Self {
+            let mut free_frames = [0u64; 64];
+            for i in 0..64 {
+                free_frames[i] = 0x1000 * (i as u64 + 1); // 0x1000, 0x2000, ...
+            }
+            Self {
+                free_frames,
+                head: 64,
+                freed_frames: [0u64; 64],
+                freed_count: 0,
+                fail_after: None,
+                alloc_count: 0,
+            }
+        }
+
+        fn with_fail_after(limit: usize) -> Self {
+            let mut a = Self::new();
+            a.fail_after = Some(limit);
+            a
+        }
+
+        fn net_allocated(&self) -> usize {
+            self.alloc_count - self.freed_count
+        }
+
+        fn alloc_count(&self) -> usize {
+            self.alloc_count
+        }
+
+        fn was_freed(&self, paddr: u64) -> bool {
+            for i in 0..self.freed_count {
+                if self.freed_frames[i] == paddr {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
+    impl FrameAllocatorTrait for MockFrameAllocator {
+        fn allocate_frame(&mut self) -> Option<u64> {
+            if let Some(limit) = self.fail_after {
+                if self.alloc_count >= limit {
+                    return None;
+                }
+            }
+            if self.head > 0 {
+                self.head -= 1;
+                let frame = self.free_frames[self.head];
+                self.alloc_count += 1;
+                Some(frame)
+            } else {
+                None
+            }
+        }
+
+        fn free_frame(&mut self, paddr: u64) {
+            assert!(self.freed_count < self.freed_frames.len());
+            self.freed_frames[self.freed_count] = paddr;
+            self.freed_count += 1;
+            assert!(self.head < self.free_frames.len());
+            self.free_frames[self.head] = paddr;
+            self.head += 1;
+        }
+    }
+
+    const EMPTY_TABLE_ENTRY: (u64, PageTable) = (0, PageTable::new());
+
+    struct MockPageTableAccessor {
+        tables: core::cell::UnsafeCell<[(u64, PageTable); 16]>,
+        zeroed: core::cell::UnsafeCell<[bool; 16]>,
+        table_count: core::cell::UnsafeCell<usize>,
+        kernel_pml4_val: core::cell::Cell<u64>,
+        active_pml4_val: core::cell::Cell<u64>,
+        tlb_flush_count: core::cell::Cell<usize>,
+        last_flushed_vaddr: core::cell::Cell<Option<u64>>,
+        fail_table_access_for: core::cell::Cell<Option<u64>>,
+    }
+
+    impl MockPageTableAccessor {
+        fn new() -> Self {
+            Self {
+                tables: core::cell::UnsafeCell::new([EMPTY_TABLE_ENTRY; 16]),
+                zeroed: core::cell::UnsafeCell::new([false; 16]),
+                table_count: core::cell::UnsafeCell::new(0),
+                kernel_pml4_val: core::cell::Cell::new(0),
+                active_pml4_val: core::cell::Cell::new(0),
+                tlb_flush_count: core::cell::Cell::new(0),
+                last_flushed_vaddr: core::cell::Cell::new(None),
+                fail_table_access_for: core::cell::Cell::new(None),
+            }
+        }
+
+        fn set_kernel_pml4(&self, paddr: u64, table: PageTable) {
+            self.kernel_pml4_val.set(paddr);
+            self.add_table(paddr, table);
+        }
+
+        fn set_active_pml4(&self, paddr: u64) {
+            self.active_pml4_val.set(paddr);
+        }
+
+        fn set_fail_table_access_for(&self, paddr: u64) {
+            self.fail_table_access_for.set(Some(paddr));
+        }
+
+        fn tlb_flush_count(&self) -> usize {
+            self.tlb_flush_count.get()
+        }
+
+        fn last_flushed_vaddr(&self) -> Option<u64> {
+            self.last_flushed_vaddr.get()
+        }
+
+        fn add_table(&self, paddr: u64, table: PageTable) {
+            let tables = unsafe { &mut *self.tables.get() };
+            let count = unsafe { &mut *self.table_count.get() };
+            for i in 0..*count {
+                if tables[i].0 == paddr {
+                    tables[i].1 = table;
+                    return;
+                }
+            }
+            assert!(*count < tables.len());
+            tables[*count] = (paddr, table);
+            *count += 1;
+        }
+
+        fn is_zeroed(&self, paddr: u64) -> bool {
+            let tables = unsafe { &*self.tables.get() };
+            let zeroed = unsafe { &*self.zeroed.get() };
+            let count = unsafe { *self.table_count.get() };
+            for i in 0..count {
+                if tables[i].0 == paddr {
+                    return zeroed[i];
+                }
+            }
+            false
+        }
+
+        fn table_count(&self) -> usize {
+            unsafe { *self.table_count.get() }
+        }
+
+        fn table_paddr(&self, idx: usize) -> u64 {
+            let tables = unsafe { &*self.tables.get() };
+            tables[idx].0
+        }
+    }
+
+    impl PageTableAccessor for MockPageTableAccessor {
+        #[allow(clippy::mut_from_ref)]
+        unsafe fn get_table_mut(&self, paddr: u64) -> Result<&mut PageTable, PagingError> {
+            if (paddr & 0xFFF) != 0 {
+                return Err(PagingError::MisalignedAddress);
+            }
+            if let Some(target) = self.fail_table_access_for.get() {
+                if target == paddr {
+                    return Err(PagingError::PhysicalAddressOutOfBounds);
+                }
+            }
+            let tables = &mut *self.tables.get();
+            let count = &mut *self.table_count.get();
+            for i in 0..*count {
+                if tables[i].0 == paddr {
+                    return Ok(&mut tables[i].1);
+                }
+            }
+            if *count < tables.len() {
+                let idx = *count;
+                tables[idx] = (paddr, PageTable::new());
+                *count += 1;
+                return Ok(&mut tables[idx].1);
+            }
+            Err(PagingError::OutOfMemory)
+        }
+
+        unsafe fn zero_frame(&self, paddr: u64) -> Result<(), PagingError> {
+            if (paddr & 0xFFF) != 0 {
+                return Err(PagingError::MisalignedAddress);
+            }
+            let tables = &mut *self.tables.get();
+            let zeroed = &mut *self.zeroed.get();
+            let count = &mut *self.table_count.get();
+            for i in 0..*count {
+                if tables[i].0 == paddr {
+                    tables[i].1 = PageTable::new();
+                    zeroed[i] = true;
+                    return Ok(());
+                }
+            }
+            if *count < tables.len() {
+                let idx = *count;
+                tables[idx] = (paddr, PageTable::new());
+                zeroed[idx] = true;
+                *count += 1;
+                return Ok(());
+            }
+            Err(PagingError::OutOfMemory)
+        }
+
+        fn kernel_root_pml4(&self) -> u64 {
+            self.kernel_pml4_val.get()
+        }
+
+        fn active_pml4(&self) -> u64 {
+            self.active_pml4_val.get()
+        }
+
+        fn flush_tlb_if_active(&self, pml4_paddr: u64, vaddr: u64) {
+            if self.active_pml4_val.get() == pml4_paddr {
+                self.tlb_flush_count.set(self.tlb_flush_count.get() + 1);
+                self.last_flushed_vaddr.set(Some(vaddr));
+            }
+        }
+    }
+
+    // 1. Every new page-table frame is zeroed before linking
+    #[test]
+    fn test_page_table_frames_zeroed_before_linking() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        assert!(accessor.is_zeroed(pml4));
+
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+        map_user_page_inner(pml4, 0x400000, 0x8000, flags, &mut allocator, &accessor).unwrap();
+
+        // PDPT, PD, and PT frames were allocated; verify every one was zeroed
+        for i in 0..accessor.table_count() {
+            let paddr = accessor.table_paddr(i);
+            if paddr != 0x8000 {
+                // Table frames must be zeroed
+                assert!(accessor.is_zeroed(paddr));
+            }
+        }
+    }
+
+    // 2. Mapping an already-present leaf returns AlreadyMapped
+    #[test]
+    fn test_map_already_mapped_returns_error() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        map_user_page_inner(pml4, 0x400000, 0x8000, flags, &mut allocator, &accessor).unwrap();
+
+        let res = map_user_page_inner(pml4, 0x400000, 0x9000, flags, &mut allocator, &accessor);
+        assert_eq!(res, Err(PagingError::AlreadyMapped));
+    }
+
+    // 3. Unmapping does not free leaf frames
+    #[test]
+    fn test_unmap_does_not_free_leaf_frame() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let leaf_paddr = 0x8000;
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        map_user_page_inner(pml4, 0x400000, leaf_paddr, flags, &mut allocator, &accessor).unwrap();
+
+        let unmapped = unmap_user_page_inner(pml4, 0x400000, &mut allocator, &accessor).unwrap();
+        assert_eq!(unmapped, leaf_paddr);
+
+        // Allocator MUST NOT have freed the leaf frame
+        assert!(!allocator.was_freed(leaf_paddr));
+    }
+
+    // 4. Address-space destruction does not free leaf frames
+    #[test]
+    fn test_destroy_user_pml4_does_not_free_leaf_frames() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let leaf1 = 0x8000;
+        let leaf2 = 0x9000;
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        map_user_page_inner(pml4, 0x400000, leaf1, flags, &mut allocator, &accessor).unwrap();
+        map_user_page_inner(pml4, 0x401000, leaf2, flags, &mut allocator, &accessor).unwrap();
+
+        destroy_user_pml4_inner(pml4, &mut allocator, &accessor);
+
+        // Table frames were freed, but leaf frames must NOT be freed!
+        assert!(!allocator.was_freed(leaf1));
+        assert!(!allocator.was_freed(leaf2));
+    }
+
+    // 5. Shared leaf frame remains mapped in another address space after one mapping is removed
+    #[test]
+    fn test_shared_leaf_frames_survive_independent_unmap() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let pml4_a = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let pml4_b = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let shared_leaf = 0x8000;
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        map_user_page_inner(
+            pml4_a,
+            0x400000,
+            shared_leaf,
+            flags,
+            &mut allocator,
+            &accessor,
+        )
+        .unwrap();
+        map_user_page_inner(
+            pml4_b,
+            0x500000,
+            shared_leaf,
+            flags,
+            &mut allocator,
+            &accessor,
+        )
+        .unwrap();
+
+        // Unmap from PML4 A
+        let unmapped = unmap_user_page_inner(pml4_a, 0x400000, &mut allocator, &accessor).unwrap();
+        assert_eq!(unmapped, shared_leaf);
+
+        // In PML4 B, the mapping must still be present and valid
+        let pt_b = unmap_user_page_inner(pml4_b, 0x500000, &mut allocator, &accessor).unwrap();
+        assert_eq!(pt_b, shared_leaf);
+    }
+
+    // 6. Failure at each intermediate allocation point rolls back all newly allocated tables
+    #[test]
+    fn test_failure_at_intermediate_allocation_rolls_back() {
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        // Test fail at PDPT: fail_after = 1 (PML4 allocated, PDPT allocation fails)
+        {
+            let mut allocator = MockFrameAllocator::with_fail_after(1);
+            let accessor = MockPageTableAccessor::new();
+            let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+            let res = map_user_page_inner(pml4, 0x400000, 0x8000, flags, &mut allocator, &accessor);
+            assert_eq!(res, Err(PagingError::OutOfMemory));
+            assert_eq!(allocator.net_allocated(), 1); // Only PML4 remains
+        }
+
+        // Test fail at PD: fail_after = 2 (PML4 allocated, PDPT allocated, PD allocation fails)
+        {
+            let mut allocator = MockFrameAllocator::with_fail_after(2);
+            let accessor = MockPageTableAccessor::new();
+            let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+            let res = map_user_page_inner(pml4, 0x400000, 0x8000, flags, &mut allocator, &accessor);
+            assert_eq!(res, Err(PagingError::OutOfMemory));
+            assert_eq!(allocator.net_allocated(), 1); // PDPT was rolled back; only PML4 remains
+        }
+
+        // Test fail at PT: fail_after = 3 (PML4 allocated, PDPT allocated, PD allocated, PT allocation fails)
+        {
+            let mut allocator = MockFrameAllocator::with_fail_after(3);
+            let accessor = MockPageTableAccessor::new();
+            let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+            let res = map_user_page_inner(pml4, 0x400000, 0x8000, flags, &mut allocator, &accessor);
+            assert_eq!(res, Err(PagingError::OutOfMemory));
+            assert_eq!(allocator.net_allocated(), 1); // PDPT and PD were rolled back; only PML4 remains
+        }
+    }
+
+    // 7. Failed mapping preserves pre-existing page-table structures
+    #[test]
+    fn test_failed_mapping_preserves_existing_page_tables() {
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+
+        // Successfully map page 1 (allocates PDPT, PD, PT)
+        map_user_page_inner(pml4, 0x400000, 0x8000, flags, &mut allocator, &accessor).unwrap();
+        let baseline_allocated = allocator.net_allocated();
+
+        // Now set fail_after to current alloc count to fail during next mapping
+        allocator.fail_after = Some(allocator.alloc_count());
+
+        // Attempting to map page in a DIFFERENT PDPT entry requires allocating a new PDPT entry / PD
+        // which fails!
+        let res = map_user_page_inner(pml4, 0x4000_0000, 0x9000, flags, &mut allocator, &accessor);
+        assert_eq!(res, Err(PagingError::OutOfMemory));
+        assert_eq!(allocator.net_allocated(), baseline_allocated);
+
+        // The pre-existing page 1 must remain intact and accessible!
+        let unmapped = unmap_user_page_inner(pml4, 0x400000, &mut allocator, &accessor).unwrap();
+        assert_eq!(unmapped, 0x8000);
+    }
+
+    // 8. Kernel-half and noncanonical virtual addresses are rejected
+    #[test]
+    fn test_kernel_half_and_noncanonical_addresses_rejected() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        // Kernel-space address
+        let res1 = map_user_page_inner(
+            pml4,
+            0xFFFF_8000_0000_0000,
+            0x8000,
+            flags,
+            &mut allocator,
+            &accessor,
+        );
+        assert_eq!(res1, Err(PagingError::KernelAddressViolation));
+
+        // Non-canonical address
+        let res2 = map_user_page_inner(
+            pml4,
+            0x0000_8000_0000_0000,
+            0x8000,
+            flags,
+            &mut allocator,
+            &accessor,
+        );
+        assert_eq!(res2, Err(PagingError::NonCanonicalAddress));
+
+        // PML4 index >= 256
+        let res3 = map_user_page_inner(
+            pml4,
+            0x0000_8000_0000_0000,
+            0x8000,
+            flags,
+            &mut allocator,
+            &accessor,
+        );
+        assert_eq!(res3, Err(PagingError::NonCanonicalAddress));
+    }
+
+    // 9. User mappings cannot obtain supervisor access
+    #[test]
+    fn test_user_mappings_cannot_obtain_supervisor_access() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+
+        // Missing USER_ACCESSIBLE
+        let flags_supervisor =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+        let res = map_user_page_inner(
+            pml4,
+            0x400000,
+            0x8000,
+            flags_supervisor,
+            &mut allocator,
+            &accessor,
+        );
+        assert_eq!(res, Err(PagingError::SupervisorOnly));
+
+        // Missing PRESENT
+        let flags_not_present = PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
+        let res2 = map_user_page_inner(
+            pml4,
+            0x400000,
+            0x8000,
+            flags_not_present,
+            &mut allocator,
+            &accessor,
+        );
+        assert_eq!(res2, Err(PagingError::SupervisorOnly));
+    }
+
+    // 10. Virtual W^X violations are rejected
+    #[test]
+    fn test_virtual_wx_violations_rejected() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+
+        // WRITABLE without NO_EXECUTE
+        let flags_wx =
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
+        let res = map_user_page_inner(pml4, 0x400000, 0x8000, flags_wx, &mut allocator, &accessor);
+        assert_eq!(res, Err(PagingError::WxViolation));
+    }
+
+    // 11. Teardown preserves all higher-half kernel entries and their referenced structures
+    #[test]
+    fn test_teardown_preserves_higher_half_kernel_entries() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        // Create a mock kernel root PML4 with higher-half entries
+        let kernel_pml4_paddr = 0xF000;
+        let mut kernel_pml4 = PageTable::new();
+        for i in 256..512 {
+            let mut entry = PageTableEntry::new();
+            entry.set_addr(
+                PhysAddr::new(0x1000 * i as u64),
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+            );
+            kernel_pml4[i] = entry;
+        }
+        accessor.set_kernel_pml4(kernel_pml4_paddr, kernel_pml4);
+
+        // Create user PML4 (copies higher half)
+        let user_pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+
+        // Map some user pages
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+        map_user_page_inner(
+            user_pml4,
+            0x400000,
+            0x8000,
+            flags,
+            &mut allocator,
+            &accessor,
+        )
+        .unwrap();
+
+        // Teardown user PML4
+        destroy_user_pml4_inner(user_pml4, &mut allocator, &accessor);
+
+        // Verify kernel root PML4 is completely untouched!
+        let kernel_table = unsafe { accessor.get_table_mut(kernel_pml4_paddr).unwrap() };
+        for i in 256..512 {
+            assert!(kernel_table[i].flags().contains(PageTableFlags::PRESENT));
+            assert_eq!(kernel_table[i].addr().as_u64(), 0x1000 * i as u64);
+        }
+        // Kernel root PML4 was not freed
+        assert!(!allocator.was_freed(kernel_pml4_paddr));
+    }
+
+    // 12. Repeated map/unmap cycles do not leak intermediate page-table frames
+    #[test]
+    fn test_repeated_map_unmap_no_leaks() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let baseline_allocated = allocator.net_allocated(); // 1 (PML4)
+
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        for _ in 0..10 {
+            map_user_page_inner(pml4, 0x400000, 0x8000, flags, &mut allocator, &accessor).unwrap();
+            let unmapped =
+                unmap_user_page_inner(pml4, 0x400000, &mut allocator, &accessor).unwrap();
+            assert_eq!(unmapped, 0x8000);
+            // Intermediate tables (PT, PD, PDPT) were reclaimed on empty!
+            assert_eq!(allocator.net_allocated(), baseline_allocated);
+        }
+    }
+
+    // 13. Unaligned addresses are rejected
+    #[test]
+    fn test_unaligned_addresses_rejected() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        // Unaligned vaddr
+        let res1 = map_user_page_inner(pml4, 0x400001, 0x8000, flags, &mut allocator, &accessor);
+        assert_eq!(res1, Err(PagingError::MisalignedAddress));
+
+        // Unaligned paddr
+        let res2 = map_user_page_inner(pml4, 0x400000, 0x8001, flags, &mut allocator, &accessor);
+        assert_eq!(res2, Err(PagingError::MisalignedAddress));
+
+        // Unaligned unmap vaddr
+        let res3 = unmap_user_page_inner(pml4, 0x400001, &mut allocator, &accessor);
+        assert_eq!(res3, Err(PagingError::MisalignedAddress));
+    }
+
+    // 14. Physical address direct-map limit check
+    #[test]
+    fn test_physical_address_direct_map_limit() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        // 0x1_0000_0000 is 4 GiB (exceeds DIRECT_MAP_LIMIT)
+        let res = map_user_page_inner(
+            pml4,
+            0x400000,
+            0x1_0000_0000,
+            flags,
+            &mut allocator,
+            &accessor,
+        );
+        assert_eq!(res, Err(PagingError::PhysicalAddressOutOfBounds));
+    }
+
+    // 15. Empty address space destruction
+    #[test]
+    fn test_empty_address_space_destruction() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        assert_eq!(allocator.net_allocated(), 1);
+
+        destroy_user_pml4_inner(pml4, &mut allocator, &accessor);
+        assert_eq!(allocator.net_allocated(), 0);
+    }
+
+    // 16. Unmapping missing intermediate entries returns NotMapped
+    #[test]
+    fn test_unmap_missing_intermediate_entries() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let res = unmap_user_page_inner(pml4, 0x400000, &mut allocator, &accessor);
+        assert_eq!(res, Err(PagingError::NotMapped));
+    }
+
+    // 17. Huge page encounters return InvalidPageTableEntry
+    #[test]
+    fn test_huge_page_encounters_during_map_and_unmap() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let flags_huge =
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::HUGE_PAGE;
+
+        // Passing HUGE_PAGE flag to map_user_page is rejected
+        let res = map_user_page_inner(
+            pml4,
+            0x400000,
+            0x8000,
+            flags_huge,
+            &mut allocator,
+            &accessor,
+        );
+        assert_eq!(res, Err(PagingError::InvalidPageTableEntry));
+    }
+
+    // 18. Allocation failure during create_user_pml4
+    #[test]
+    fn test_allocation_failure_during_create_user_pml4() {
+        let mut allocator = MockFrameAllocator::with_fail_after(0); // Fails immediately
+        let accessor = MockPageTableAccessor::new();
+
+        let res = create_user_pml4_inner(&mut allocator, &accessor);
+        assert_eq!(res, Err(PagingError::OutOfMemory));
+        assert_eq!(allocator.net_allocated(), 0);
+    }
+
+    // 19. Multiple mappings in independent address spaces
+    #[test]
+    fn test_multiple_mappings_in_independent_address_spaces() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let pml4_a = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let pml4_b = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        // Same virtual address mapped to different physical frames in independent PML4s
+        map_user_page_inner(pml4_a, 0x400000, 0x8000, flags, &mut allocator, &accessor).unwrap();
+        map_user_page_inner(pml4_b, 0x400000, 0x9000, flags, &mut allocator, &accessor).unwrap();
+
+        let unmap_a = unmap_user_page_inner(pml4_a, 0x400000, &mut allocator, &accessor).unwrap();
+        let unmap_b = unmap_user_page_inner(pml4_b, 0x400000, &mut allocator, &accessor).unwrap();
+
+        assert_eq!(unmap_a, 0x8000);
+        assert_eq!(unmap_b, 0x9000);
+    }
+
+    // =========================================================================
+    // Stage 3.0 Audit Remediation Tests (Findings 1, 2, 3)
+    // =========================================================================
+
+    // 20. Finding 2: TLB invalidation occurs only upon successful mapping in the active address space
+    #[test]
+    fn test_map_user_page_triggers_tlb_invalidation_only_on_success_in_active_address_space() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let active_pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+        let inactive_pml4 = create_user_pml4_inner(&mut allocator, &accessor).unwrap();
+
+        // Mark active_pml4 as loaded in CR3
+        accessor.set_active_pml4(active_pml4);
+        assert_eq!(accessor.tlb_flush_count(), 0);
+
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+
+        // 1. Successful mapping into active address space MUST trigger TLB flush
+        map_user_page_inner(
+            active_pml4,
+            0x400000,
+            0x8000,
+            flags,
+            &mut allocator,
+            &accessor,
+        )
+        .unwrap();
+        assert_eq!(accessor.tlb_flush_count(), 1);
+        assert_eq!(accessor.last_flushed_vaddr(), Some(0x400000));
+
+        // 2. Failed mapping (AlreadyMapped) MUST NOT trigger TLB flush
+        let res_fail = map_user_page_inner(
+            active_pml4,
+            0x400000,
+            0x9000,
+            flags,
+            &mut allocator,
+            &accessor,
+        );
+        assert_eq!(res_fail, Err(PagingError::AlreadyMapped));
+        assert_eq!(accessor.tlb_flush_count(), 1); // Count unchanged
+
+        // 3. Successful mapping into INACTIVE address space MUST NOT trigger TLB flush
+        map_user_page_inner(
+            inactive_pml4,
+            0x400000,
+            0x9000,
+            flags,
+            &mut allocator,
+            &accessor,
+        )
+        .unwrap();
+        assert_eq!(accessor.tlb_flush_count(), 1); // Count still unchanged (CR3 reload contract)
+    }
+
+    // 21. Finding 3: create_user_pml4 frees allocated root frame if higher-half copy fails
+    #[test]
+    fn test_create_user_pml4_frees_root_frame_on_higher_half_copy_failure() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let kernel_pml4_paddr = 0xF000;
+        let kernel_pml4 = PageTable::new();
+        accessor.set_kernel_pml4(kernel_pml4_paddr, kernel_pml4);
+
+        let baseline_allocated = allocator.net_allocated();
+
+        // Inject table access failure for the kernel source PML4 during higher-half copying
+        accessor.set_fail_table_access_for(kernel_pml4_paddr);
+
+        let res = create_user_pml4_inner(&mut allocator, &accessor);
+        assert_eq!(res, Err(PagingError::PhysicalAddressOutOfBounds));
+
+        // The newly allocated user PML4 frame must have been freed back to allocator; no leaks!
+        assert_eq!(allocator.net_allocated(), baseline_allocated);
+    }
+
+    // 22. Finding 1: destroy_user_pml4 protects authoritative kernel root regardless of current CR3
+    #[test]
+    fn test_destroy_user_pml4_protects_authoritative_kernel_root_even_when_cr3_differs() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let kernel_pml4_paddr = 0xF000;
+        let kernel_pml4 = PageTable::new();
+        accessor.set_kernel_pml4(kernel_pml4_paddr, kernel_pml4);
+
+        // Simulate active CR3 pointing to a user task address space (0x2000)
+        accessor.set_active_pml4(0x2000);
+
+        // Attempting to destroy authoritative kernel root must be rejected
+        destroy_user_pml4_inner(kernel_pml4_paddr, &mut allocator, &accessor);
+
+        // Kernel root frame must NOT be freed!
+        assert!(!allocator.was_freed(kernel_pml4_paddr));
+    }
+
+    // 23. Finding 1: destroy_user_pml4 protects currently active root in CR3
+    #[test]
+    fn test_destroy_user_pml4_protects_currently_active_root() {
+        let mut allocator = MockFrameAllocator::new();
+        let accessor = MockPageTableAccessor::new();
+
+        let active_user_pml4 = 0x2000;
+        accessor.set_active_pml4(active_user_pml4);
+
+        // Attempting to destroy currently active CR3 root must be rejected
+        destroy_user_pml4_inner(active_user_pml4, &mut allocator, &accessor);
+
+        // Active root frame must NOT be freed!
+        assert!(!allocator.was_freed(active_user_pml4));
     }
 }
