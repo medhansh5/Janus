@@ -423,57 +423,6 @@ fn copy_from_user_with_reader<R: PageReader>(
     Ok(())
 }
 
-/// Unsafe helper to copy from userspace using an arbitrary root page table and direct map offset.
-///
-/// Retained as a public kernel memory interface for cross-address-space task inspection.
-///
-/// # Safety
-/// - `pml4` must be an authentic, valid page table.
-/// - `phys_offset` must be the higher-half direct physical mapping offset mapping physical memory
-///   up to `DIRECT_MAP_LIMIT`.
-/// - Memory referenced by `pml4` must not be concurrently unmapped or modified during the copy.
-#[allow(dead_code)]
-pub unsafe fn copy_from_user_with_pml4(
-    pml4: &PageTable,
-    phys_offset: u64,
-    user_vaddr: u64,
-    buf: &mut [u8],
-) -> Result<(), UserCopyError> {
-    struct OffsetReader(u64);
-    unsafe impl PageReader for OffsetReader {
-        fn read_table(&self, paddr: u64) -> Result<&PageTable, UserCopyError> {
-            let end_paddr = paddr
-                .checked_add(4096)
-                .ok_or(UserCopyError::ArithmeticOverflow)?;
-            if end_paddr > DIRECT_MAP_LIMIT || (paddr & 0xFFF) != 0 {
-                return Err(UserCopyError::InvalidPhysicalAddress);
-            }
-            let vaddr = paddr
-                .checked_add(self.0)
-                .ok_or(UserCopyError::ArithmeticOverflow)?;
-            Ok(unsafe { &*(vaddr as *const PageTable) })
-        }
-        fn read_bytes(&self, paddr: u64, buf: &mut [u8]) -> Result<(), UserCopyError> {
-            let len = buf.len() as u64;
-            let end_paddr = paddr
-                .checked_add(len)
-                .ok_or(UserCopyError::ArithmeticOverflow)?;
-            if end_paddr > DIRECT_MAP_LIMIT {
-                return Err(UserCopyError::InvalidPhysicalAddress);
-            }
-            let vaddr = paddr
-                .checked_add(self.0)
-                .ok_or(UserCopyError::ArithmeticOverflow)?;
-            unsafe {
-                core::ptr::copy(vaddr as *const u8, buf.as_mut_ptr(), buf.len());
-            }
-            Ok(())
-        }
-    }
-    let reader = OffsetReader(phys_offset);
-    copy_from_user_with_reader(&reader, pml4, user_vaddr, buf)
-}
-
 /// Safely copies `buf.len()` bytes from user virtual address `user_vaddr` in the active address space
 /// (from CR3) into kernel buffer `buf`.
 ///
