@@ -98,7 +98,11 @@ pub unsafe fn register_task(task: Task) {
 }
 
 /// # Safety
-/// Caller must guarantee single-threaded access to `id`.
+/// - Caller must guarantee single-threaded access to `id`.
+/// - Caller must ensure no other active reference (`&Task` or `&mut Task`) to task `id` exists
+///   concurrently for the lifetime `'a`.
+/// - The returned mutable reference must not be retained across operations that access the task table
+///   (such as `schedule()` or subsequent calls to `get_task_mut`/`current_task_mut`).
 pub unsafe fn get_task_mut<'a>(id: u64) -> Option<&'a mut Task> {
     if id < MAX_TASKS as u64 {
         TASKS[id as usize].as_mut()
@@ -108,7 +112,11 @@ pub unsafe fn get_task_mut<'a>(id: u64) -> Option<&'a mut Task> {
 }
 
 /// # Safety
-/// Caller must guarantee single-threaded access to current task state.
+/// - Caller must guarantee single-threaded access to current task state.
+/// - Caller must ensure no other active reference (`&Task` or `&mut Task`) to current task exists
+///   concurrently for the lifetime `'a`.
+/// - The returned mutable reference must not be retained across operations that access the task table
+///   (such as `schedule()`).
 pub unsafe fn current_task_mut<'a>() -> Option<&'a mut Task> {
     if let Some(id) = CURRENT_TASK_ID {
         get_task_mut(id)
