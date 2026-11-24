@@ -235,7 +235,7 @@ fn translate_user_page<R: PageReader>(
     let p4_idx = virt_addr.p4_index();
 
     // User space mappings must strictly reside in PML4 entries 0..255
-    if p4_idx.as_u16() >= 256 {
+    if u16::from(p4_idx) >= 256 {
         return Err(UserCopyError::KernelAddress);
     }
 
