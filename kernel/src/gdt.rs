@@ -10,8 +10,12 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 // Placed statically in .bss so it is permanently mapped and accessible
 // even if the active kernel stack overflows or becomes unmapped.
 #[repr(align(16))]
-struct DoubleFaultStack([u8; 4096]);
-static mut DOUBLE_FAULT_STACK: DoubleFaultStack = DoubleFaultStack([0; 4096]);
+struct DoubleFaultStack {
+    _storage: [u8; 4096],
+}
+static mut DOUBLE_FAULT_STACK: DoubleFaultStack = DoubleFaultStack {
+    _storage: [0; 4096],
+};
 
 /// Encapsulated, sound interior-mutability wrapper for the Task State Segment.
 ///

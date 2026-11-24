@@ -425,12 +425,15 @@ fn copy_from_user_with_reader<R: PageReader>(
 
 /// Unsafe helper to copy from userspace using an arbitrary root page table and direct map offset.
 ///
+/// Retained as a public kernel memory interface for cross-address-space task inspection.
+///
 /// # Safety
 /// - `pml4` must be an authentic, valid page table.
 /// - `phys_offset` must be the higher-half direct physical mapping offset mapping physical memory
 ///   up to `DIRECT_MAP_LIMIT`.
 /// - Memory referenced by `pml4` must not be concurrently unmapped or modified during the copy.
-pub(crate) unsafe fn copy_from_user_with_pml4(
+#[allow(dead_code)]
+pub unsafe fn copy_from_user_with_pml4(
     pml4: &PageTable,
     phys_offset: u64,
     user_vaddr: u64,
@@ -505,7 +508,6 @@ mod tests {
     use super::*;
     use x86_64::structures::paging::PageTableFlags;
 
-    #[derive(Default)]
     struct MockPageReader {
         tables: [(u64, PageTable); 8],
         table_count: usize,
@@ -515,7 +517,21 @@ mod tests {
 
     impl MockPageReader {
         fn new() -> Self {
-            Self::default()
+            Self {
+                tables: [
+                    (0, PageTable::new()),
+                    (0, PageTable::new()),
+                    (0, PageTable::new()),
+                    (0, PageTable::new()),
+                    (0, PageTable::new()),
+                    (0, PageTable::new()),
+                    (0, PageTable::new()),
+                    (0, PageTable::new()),
+                ],
+                table_count: 0,
+                memory: [(0, [0u8; 64]); 8],
+                memory_count: 0,
+            }
         }
 
         fn add_table(&mut self, paddr: u64, table: PageTable) {
@@ -528,6 +544,12 @@ mod tests {
             assert!(self.memory_count < self.memory.len());
             self.memory[self.memory_count] = (paddr, data);
             self.memory_count += 1;
+        }
+    }
+
+    impl Default for MockPageReader {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -923,10 +945,10 @@ mod tests {
     fn test_reader_unaligned_page_table_address() {
         let reader = MockPageReader::new();
         // 0x1001 is not 4 KiB aligned; read_table must reject it immediately
-        assert_eq!(
+        assert!(matches!(
             reader.read_table(0x1001),
             Err(UserCopyError::InvalidPhysicalAddress)
-        );
+        ));
     }
 
     #[test]
