@@ -25,11 +25,45 @@ pub fn handle_syscall(sys_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, 
         SYS_OUT_PORT => sys_out_port(CPtr(arg1 as usize), arg2 as u16, arg3 as u32, arg4 as u8),
         SYS_LOG => {
             let mut serial = crate::SerialPort(0x3F8);
-            let val = unsafe { *(arg1 as *const u32) };
-            serial.write_str("[KERNEL] USERSPACE LOG DATA: ");
-            serial.write_hex(val as u64);
-            serial.write_str("\n");
-            0
+            match crate::paging::copy_user_u32(arg1) {
+                Ok(val) => {
+                    serial.write_str("[KERNEL] USERSPACE LOG DATA: ");
+                    serial.write_hex(val as u64);
+                    serial.write_str("\n");
+                    0
+                }
+                Err(err) => {
+                    serial.write_str("[KERNEL SEC-FAULT] SYS_LOG invalid user pointer: ");
+                    serial.write_hex(arg1);
+                    serial.write_str(" (error: ");
+                    match err {
+                        crate::paging::UserCopyError::NullPointer => {
+                            serial.write_str("NullPointer")
+                        }
+                        crate::paging::UserCopyError::KernelAddress => {
+                            serial.write_str("KernelAddress")
+                        }
+                        crate::paging::UserCopyError::NonCanonical => {
+                            serial.write_str("NonCanonical")
+                        }
+                        crate::paging::UserCopyError::ArithmeticOverflow => {
+                            serial.write_str("ArithmeticOverflow")
+                        }
+                        crate::paging::UserCopyError::NotMapped => serial.write_str("NotMapped"),
+                        crate::paging::UserCopyError::SupervisorOnly => {
+                            serial.write_str("SupervisorOnly")
+                        }
+                        crate::paging::UserCopyError::InvalidPhysicalAddress => {
+                            serial.write_str("InvalidPhysicalAddress")
+                        }
+                        crate::paging::UserCopyError::InvalidPageTableEntry => {
+                            serial.write_str("InvalidPageTableEntry")
+                        }
+                    }
+                    serial.write_str(")\n");
+                    !0
+                }
+            }
         }
         _ => !0, // ENOSYS
     }
