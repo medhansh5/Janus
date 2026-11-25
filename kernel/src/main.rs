@@ -394,10 +394,10 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
     let cnode_b =
         unsafe { &mut *((cnode_b_paddr + paging::PHYS_MEMORY_OFFSET) as *mut capability::CNode) };
     for i in 0..capability::CNODE_SLOTS {
-        cnode_a.slots[i] = capability::Capability::Empty;
+        cnode_a.slots[i] = capability::CNodeSlot::empty();
     }
     for i in 0..capability::CNODE_SLOTS {
-        cnode_b.slots[i] = capability::Capability::Empty;
+        cnode_b.slots[i] = capability::CNodeSlot::empty();
     }
 
     // Grant Capabilities!
@@ -428,39 +428,16 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
     }
 
     // Task A (Client Task):
-    // CPtr 1 = send to Task B, CPtr 2 = recv from Task B
-    // CPtr 3 = Shared Memory Frame
-    cnode_a.slots[1] = capability::Capability::Endpoint { target_task_id: 1 };
-    cnode_a.slots[2] = capability::Capability::Endpoint { target_task_id: 1 };
-    cnode_a.slots[3] = capability::Capability::Frame {
-        paddr: shared_mem_paddr,
-    };
+    capability::init_task_a_bootstrap_cnode(cnode_a, shared_mem_paddr);
 
     // Task B (Virtio Driver Task):
-    // CPtr 1 = recv endpoint, CPtr 2 = send to Task A
-    // CPtr 3 = Shared Memory Frame
-    // CPtr 4 = Virtqueue Frame
-    // CPtr 5 = IOPort (Virtio-blk)
-    // CPtr 6 = InterruptEndpoint (IRQ 14)
-    cnode_b.slots[1] = capability::Capability::Endpoint { target_task_id: 0 };
-    cnode_b.slots[2] = capability::Capability::Endpoint { target_task_id: 0 };
-    cnode_b.slots[3] = capability::Capability::Frame {
-        paddr: shared_mem_paddr,
-    };
-    cnode_b.slots[4] = capability::Capability::Frame {
-        paddr: virtqueue_paddr,
-    };
-
-    // CPtr 5 = IOPort
-    let io_port = capability::Capability::IOPort {
-        base: virtio_io_base,
-        size: 64,
-    };
-    cnode_b.slots[5] = io_port;
-
-    // CPtr 6 = InterruptEndpoint
-    let irq_ep = capability::Capability::InterruptEndpoint { irq: virtio_irq };
-    cnode_b.slots[6] = irq_ep;
+    capability::init_task_b_bootstrap_cnode(
+        cnode_b,
+        shared_mem_paddr,
+        virtqueue_paddr,
+        virtio_io_base,
+        virtio_irq,
+    );
 
     // Allocate Stacks for A and B
     let stack_a_paddr = allocator
@@ -474,13 +451,13 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
     let task_a = task::Task::new(
         0,
         PhysAddr::new(user_pml4_paddr),
-        capability::CPtr((cnode_a_paddr + paging::PHYS_MEMORY_OFFSET) as usize),
+        capability::CPtr(cnode_a_paddr + paging::PHYS_MEMORY_OFFSET),
         stack_a_paddr + paging::PHYS_MEMORY_OFFSET + 4096,
     );
     let mut task_b = task::Task::new(
         1,
         PhysAddr::new(user_pml4_paddr),
-        capability::CPtr((cnode_b_paddr + paging::PHYS_MEMORY_OFFSET) as usize),
+        capability::CPtr(cnode_b_paddr + paging::PHYS_MEMORY_OFFSET),
         stack_b_paddr + paging::PHYS_MEMORY_OFFSET + 4096,
     );
 

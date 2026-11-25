@@ -1,4 +1,4 @@
-use crate::capability::{CPtr, Capability};
+use crate::capability::{CNodeSlot, CPtr, CapRights, CapType};
 use crate::task::TaskState;
 
 pub const SYS_SEND: u64 = 1;
@@ -9,20 +9,24 @@ pub const SYS_CAP_INFO: u64 = 5;
 pub const SYS_IN_PORT: u64 = 6;
 pub const SYS_OUT_PORT: u64 = 7;
 pub const SYS_LOG: u64 = 8;
+pub const SYS_CAP_MINT: u64 = 13;
+pub const SYS_CAP_REVOKE: u64 = 14;
+pub const SYS_CAP_COPY: u64 = 20;
+pub const SYS_CAP_DELETE: u64 = 21;
 
 /// The main entry point for syscalls dispatched from assembly.
 pub fn handle_syscall(sys_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, _arg5: u64) -> u64 {
     match sys_num {
-        SYS_SEND => sys_send(CPtr(arg1 as usize), arg2),
-        SYS_RECV => sys_recv(CPtr(arg1 as usize), arg2),
+        SYS_SEND => sys_send(CPtr(arg1), arg2),
+        SYS_RECV => sys_recv(CPtr(arg1), arg2),
         SYS_REPLY => sys_reply(arg1),
         SYS_YIELD => {
             unsafe { crate::task::schedule() };
             0
         }
-        SYS_CAP_INFO => sys_cap_info(CPtr(arg1 as usize)),
-        SYS_IN_PORT => sys_in_port(CPtr(arg1 as usize), arg2 as u16, arg3 as u8),
-        SYS_OUT_PORT => sys_out_port(CPtr(arg1 as usize), arg2 as u16, arg3 as u32, arg4 as u8),
+        SYS_CAP_INFO => sys_cap_info(CPtr(arg1)),
+        SYS_IN_PORT => sys_in_port(CPtr(arg1), arg2 as u16, arg3 as u8),
+        SYS_OUT_PORT => sys_out_port(CPtr(arg1), arg2 as u16, arg3 as u32, arg4 as u8),
         SYS_LOG => {
             let mut serial = crate::SerialPort(0x3F8);
             match crate::paging::copy_user_u32(arg1) {
@@ -65,6 +69,10 @@ pub fn handle_syscall(sys_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, 
                 }
             }
         }
+        SYS_CAP_MINT => sys_cap_mint(CPtr(arg1), arg2 as usize, arg3 as u8, arg4),
+        SYS_CAP_REVOKE => sys_cap_revoke(CPtr(arg1)),
+        SYS_CAP_COPY => sys_cap_copy(CPtr(arg1), arg2 as usize),
+        SYS_CAP_DELETE => sys_cap_delete(CPtr(arg1)),
         _ => !0, // ENOSYS
     }
 }
@@ -74,32 +82,20 @@ pub fn handle_syscall(sys_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, 
 pub enum CapLookupError {
     /// Slot index is greater than or equal to `CNODE_SLOTS` (128).
     OutOfBounds,
+    /// Handle has reserved bits set or zero generation.
+    InvalidHandle,
     /// CNode pointer is null, unaligned, or outside the direct physical memory map.
     InvalidCNodePointer,
+    /// Generation mismatch between handle and slot.
+    StaleHandle,
 }
 
-/// Safely retrieves a copy of the `Capability` from the task's root CNode.
-///
-/// # Preconditions & Safety Invariants
-/// In Janus, all valid task CNodes are allocated by the kernel during stage 2 boot
-/// via `FrameAllocator::allocate_frame()` and mapped into the higher-half direct physical map
-/// at `PHYS_MEMORY_OFFSET + paddr` with 4096-byte alignment (`CNode` alignment).
-///
-/// This function verifies that:
-/// 1. `slot.0 < CNODE_SLOTS` (prevents out-of-bounds array reads).
-/// 2. `root_cnode.0 != 0` (prevents null-pointer dereference, e.g. for `task_idle`).
-/// 3. `root_cnode.0` is 4096-byte aligned.
-/// 4. `root_cnode.0` resides strictly within the direct-mapped physical memory range
-///    `[PHYS_MEMORY_OFFSET .. PHYS_MEMORY_OFFSET + DIRECT_MAP_LIMIT)`.
-///
-/// Note: Address and alignment checks alone do not prove arbitrary pointer validity;
-/// dereference safety relies fundamentally on trusted kernel allocation and assignment during
-/// task creation.
-fn lookup_cap(root_cnode: CPtr, slot: CPtr) -> Result<Capability, CapLookupError> {
-    if slot.0 >= crate::capability::CNODE_SLOTS {
-        return Err(CapLookupError::OutOfBounds);
+/// Safely retrieves a copy of the `CNodeSlot` from the task's root CNode.
+fn lookup_cap(root_cnode: CPtr, slot: CPtr) -> Result<CNodeSlot, CapLookupError> {
+    if !slot.is_canonical() {
+        return Err(CapLookupError::InvalidHandle);
     }
-    let vaddr = root_cnode.0 as u64;
+    let vaddr = root_cnode.0;
     if vaddr < crate::paging::PHYS_MEMORY_OFFSET
         || (vaddr & 0xFFF) != 0
         || vaddr >= crate::paging::PHYS_MEMORY_OFFSET + crate::paging::DIRECT_MAP_LIMIT
@@ -107,7 +103,11 @@ fn lookup_cap(root_cnode: CPtr, slot: CPtr) -> Result<Capability, CapLookupError
         return Err(CapLookupError::InvalidCNodePointer);
     }
     let cnode = unsafe { &*(vaddr as *const crate::capability::CNode) };
-    Ok(cnode.slots[slot.0])
+    let s = cnode.slots[slot.slot()];
+    if s.generation != slot.generation() {
+        return Err(CapLookupError::StaleHandle);
+    }
+    Ok(s)
 }
 
 /// Send a message to an endpoint.
@@ -121,11 +121,19 @@ fn sys_send(endpoint_cptr: CPtr, msg: u64) -> u64 {
         (sender.id, sender.root_cnode)
     }; // Borrow of sender drops here
 
-    // 2. Validate the capability
+    // 2. Validate the capability and WRITE rights
     let target_task_id = match lookup_cap(sender_cnode, endpoint_cptr) {
-        Ok(Capability::Endpoint { target_task_id }) => target_task_id,
-        Err(CapLookupError::OutOfBounds) | Err(CapLookupError::InvalidCNodePointer) => {
-            // Out-of-bounds slot: return !0 without mutating task state or terminating
+        Ok(s) if s.cap_type == CapType::Endpoint => {
+            if !s.rights.contains(CapRights::WRITE) {
+                return !0;
+            }
+            s.payload_a
+        }
+        Err(CapLookupError::OutOfBounds)
+        | Err(CapLookupError::InvalidHandle)
+        | Err(CapLookupError::InvalidCNodePointer)
+        | Err(CapLookupError::StaleHandle) => {
+            // Out-of-bounds, invalid pointer, or stale slot: return !0 without mutating task state
             return !0;
         }
         Ok(_) => {
@@ -160,9 +168,9 @@ fn sys_send(endpoint_cptr: CPtr, msg: u64) -> u64 {
         }
         if let TaskState::BlockedOnRecv { endpoint: recv_ep } = target.state {
             match lookup_cap(target.root_cnode, recv_ep) {
-                Ok(Capability::Endpoint {
-                    target_task_id: expected_sender,
-                }) => expected_sender == sender_id,
+                Ok(s) if s.cap_type == CapType::Endpoint => {
+                    s.rights.contains(CapRights::READ) && s.payload_a == sender_id
+                }
                 _ => false, // Target waiting on IRQ or invalid cap: NEVER wake
             }
         } else {
@@ -228,9 +236,12 @@ fn sys_recv(endpoint_cptr: CPtr, _msg_ptr: u64) -> u64 {
         Err(_) => return !0,
     };
 
-    match cap {
-        // Check if this is an InterruptEndpoint
-        Capability::InterruptEndpoint { irq: _ } => {
+    match cap.cap_type {
+        // Check if this is an Irq capability (replaces InterruptEndpoint)
+        CapType::Irq => {
+            if !cap.rights.contains(CapRights::READ) {
+                return !0;
+            }
             {
                 if let Some(receiver) = unsafe { crate::task::current_task_mut() } {
                     receiver.state = TaskState::BlockedOnRecv {
@@ -252,9 +263,12 @@ fn sys_recv(endpoint_cptr: CPtr, _msg_ptr: u64) -> u64 {
             }
         }
 
-        Capability::Endpoint {
-            target_task_id: expected_sender_id,
-        } => {
+        CapType::Endpoint => {
+            if !cap.rights.contains(CapRights::READ) {
+                return !0;
+            }
+            let expected_sender_id = cap.payload_a;
+
             // Reject self-receive and invalid IDs before any mutation
             if expected_sender_id == receiver_id
                 || expected_sender_id >= crate::task::MAX_TASKS as u64
@@ -273,8 +287,8 @@ fn sys_recv(endpoint_cptr: CPtr, _msg_ptr: u64) -> u64 {
                 }
                 if let TaskState::BlockedOnSend { endpoint: send_ep } = sender.state {
                     match lookup_cap(sender.root_cnode, send_ep) {
-                        Ok(Capability::Endpoint { target_task_id }) => {
-                            target_task_id == receiver_id
+                        Ok(s) if s.cap_type == CapType::Endpoint => {
+                            s.rights.contains(CapRights::WRITE) && s.payload_a == receiver_id
                         }
                         _ => false,
                     }
@@ -339,12 +353,12 @@ fn sys_reply(_msg: u64) -> u64 {
 }
 
 fn sys_cap_info(endpoint_cptr: CPtr) -> u64 {
-    let (task_id, task_cnode) = {
+    let task_cnode = {
         let task = match unsafe { crate::task::current_task_mut() } {
             Some(t) => t,
             None => return !0,
         };
-        (task.id, task.root_cnode)
+        task.root_cnode
     };
 
     let cap = match lookup_cap(task_cnode, endpoint_cptr) {
@@ -352,22 +366,14 @@ fn sys_cap_info(endpoint_cptr: CPtr) -> u64 {
         Err(_) => return !0,
     };
 
-    match cap {
-        Capability::Frame { paddr } => paddr,
-        Capability::IOPort { base, size } => (base as u64) | ((size as u64) << 16),
+    match cap.cap_type {
+        CapType::Frame | CapType::MmioFrame => cap.payload_a,
+        CapType::IOPort => cap.payload_a,
+        CapType::Empty => !0,
         _ => {
-            let mut serial = crate::SerialPort(0x3F8);
-            serial.write_str("[KERNEL SEC-FAULT] Task ");
-            serial.write_hex(task_id);
-            serial.write_str(
-                " attempted to query invalid capability slot via SYS_CAP_INFO! Terminating.\n",
-            );
-
-            if let Some(task) = unsafe { crate::task::current_task_mut() } {
-                task.state = crate::task::TaskState::Terminated;
-            }
-            unsafe { crate::task::schedule() };
-            !0
+            (cap.cap_type as u64)
+                | ((cap.rights.bits() as u64) << 8)
+                | ((cap.generation as u64) << 16)
         }
     }
 }
@@ -377,10 +383,8 @@ pub fn wake_irq(irq: u8) {
         for i in 0..crate::task::MAX_TASKS {
             if let Some(t) = crate::task::get_task_mut(i as u64) {
                 if let TaskState::BlockedOnRecv { endpoint } = t.state {
-                    if let Ok(Capability::InterruptEndpoint { irq: cap_irq }) =
-                        lookup_cap(t.root_cnode, endpoint)
-                    {
-                        if cap_irq == irq {
+                    if let Ok(slot) = lookup_cap(t.root_cnode, endpoint) {
+                        if slot.cap_type == CapType::Irq && (slot.payload_a as u8) == irq {
                             t.state = TaskState::Runnable;
                             t.ipc_message = 0; // Empty message indicates IRQ
                             return; // Assuming only one task listens to an IRQ
@@ -406,33 +410,31 @@ fn sys_in_port(endpoint_cptr: CPtr, offset: u16, width: u8) -> u64 {
         Err(_) => return !0,
     };
 
-    if let Capability::IOPort { base, size } = cap {
-        if offset >= size {
-            return !0;
-        }
-        let port = base + offset;
-        unsafe {
-            match width {
-                1 => {
-                    let mut v: u8;
-                    core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags));
-                    v as u64
-                }
-                2 => {
-                    let mut v: u16;
-                    core::arch::asm!("in ax, dx", out("ax") v, in("dx") port, options(nomem, nostack, preserves_flags));
-                    v as u64
-                }
-                4 => {
-                    let mut v: u32;
-                    core::arch::asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags));
-                    v as u64
-                }
-                _ => !0,
+    let port =
+        match crate::capability::validate_io_port_access(&cap, CapRights::READ, offset, width) {
+            Ok(p) => p,
+            Err(_) => return !0,
+        };
+
+    unsafe {
+        match width {
+            1 => {
+                let mut v: u8;
+                core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags));
+                v as u64
             }
+            2 => {
+                let mut v: u16;
+                core::arch::asm!("in ax, dx", out("ax") v, in("dx") port, options(nomem, nostack, preserves_flags));
+                v as u64
+            }
+            4 => {
+                let mut v: u32;
+                core::arch::asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags));
+                v as u64
+            }
+            _ => !0,
         }
-    } else {
-        !0
     }
 }
 
@@ -450,29 +452,77 @@ fn sys_out_port(endpoint_cptr: CPtr, offset: u16, val: u32, width: u8) -> u64 {
         Err(_) => return !0,
     };
 
-    if let Capability::IOPort { base, size } = cap {
-        if offset >= size {
-            return !0;
-        }
-        let port = base + offset;
-        unsafe {
-            match width {
-                1 => {
-                    core::arch::asm!("out dx, al", in("dx") port, in("al") (val as u8), options(nomem, nostack, preserves_flags));
-                    0
-                }
-                2 => {
-                    core::arch::asm!("out dx, ax", in("dx") port, in("ax") (val as u16), options(nomem, nostack, preserves_flags));
-                    0
-                }
-                4 => {
-                    core::arch::asm!("out dx, eax", in("dx") port, in("eax") val, options(nomem, nostack, preserves_flags));
-                    0
-                }
-                _ => !0,
+    let port =
+        match crate::capability::validate_io_port_access(&cap, CapRights::WRITE, offset, width) {
+            Ok(p) => p,
+            Err(_) => return !0,
+        };
+
+    unsafe {
+        match width {
+            1 => {
+                core::arch::asm!("out dx, al", in("dx") port, in("al") (val as u8), options(nomem, nostack, preserves_flags));
+                0
             }
+            2 => {
+                core::arch::asm!("out dx, ax", in("dx") port, in("ax") (val as u16), options(nomem, nostack, preserves_flags));
+                0
+            }
+            4 => {
+                core::arch::asm!("out dx, eax", in("dx") port, in("eax") val, options(nomem, nostack, preserves_flags));
+                0
+            }
+            _ => !0,
         }
-    } else {
-        !0
+    }
+}
+
+fn sys_cap_mint(src_cptr: CPtr, dest_slot: usize, rights: u8, badge: u64) -> u64 {
+    let current_task_id = match crate::task::current_task_id() {
+        Some(id) => id as u8,
+        None => return !0,
+    };
+    let cap_rights = match CapRights::from_bits(rights) {
+        Some(r) => r,
+        None => return !0,
+    };
+    match unsafe {
+        crate::capability::mint_cap(current_task_id, src_cptr, dest_slot, cap_rights, badge)
+    } {
+        Ok(_) => 0,
+        Err(_) => !0,
+    }
+}
+
+fn sys_cap_copy(src_cptr: CPtr, dest_slot: usize) -> u64 {
+    let current_task_id = match crate::task::current_task_id() {
+        Some(id) => id as u8,
+        None => return !0,
+    };
+    match unsafe { crate::capability::copy_cap(current_task_id, src_cptr, dest_slot) } {
+        Ok(_) => 0,
+        Err(_) => !0,
+    }
+}
+
+fn sys_cap_revoke(cptr: CPtr) -> u64 {
+    let current_task_id = match crate::task::current_task_id() {
+        Some(id) => id as u8,
+        None => return !0,
+    };
+    match unsafe { crate::capability::revoke_cap(current_task_id, cptr) } {
+        Ok(()) => 0,
+        Err(_) => !0,
+    }
+}
+
+fn sys_cap_delete(cptr: CPtr) -> u64 {
+    let current_task_id = match crate::task::current_task_id() {
+        Some(id) => id as u8,
+        None => return !0,
+    };
+    match unsafe { crate::capability::delete_cap(current_task_id, cptr) } {
+        Ok(()) => 0,
+        Err(_) => !0,
     }
 }
