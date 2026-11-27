@@ -4,25 +4,23 @@ This document lists explicit technical limitations, constraints, and non-goals i
 
 ## System & Execution Constraints
 
-### 1. Uniprocessor (Single-Core Execution)
-- **Constraint**: Janus currently executes on a single x86_64 CPU core using the 8259 PIC / APIC single-core timer for IRQ0 preemptive scheduling.
-- **Impact**: Multi-threading across multiple physical CPU cores is not supported in the v1 release. Multi-core execution via x2APIC and IPI scheduling is scheduled for v4.
+### 1. Uniprocessor (Single-Core Execution) & Syscall Entry
+- **Constraint**: Janus executes on a single x86_64 CPU core using the 8259 PIC and 8254 PIT (IRQ0 at 1000 Hz) for preemptive scheduling.
+- **Syscall Scratch Assumption**: `syscall_entry` (`kernel/src/syscall.rs`) uses global `USER_RSP_SCRATCH` and `KERNEL_RSP_SCRATCH` variables with `SFMask` clearing `IF=0` on entry and zeroing `USER_RSP_SCRATCH` immediately after pushing the frame. This is safe under single-core execution with maskable interrupts disabled, but is **not SMP-safe** and **not reentrant** under an NMI or fault during the entry window.
+- **Impact**: Multi-core SMP (x2APIC, IPIs, per-CPU `swapgs` kernel stacks) is deferred to a future milestone.
 
-### 2. Userland Application Interface
+### 2. VirtIO Block Driver Limitations
+- **Transport**: Only legacy VirtIO 0.9.5 PCI (`vendor 0x1AF4`, `device 0x1001`) with an I/O-space `BAR0` and queue size `<= 256` is supported. Modern VirtIO 1.x MMIO/PCI capability-list transport and NVMe are not implemented.
+- **Synchronous Polling**: `VirtioBlockDevice::read_sector` and `write_sector` poll `used.idx` synchronously with a bounded spin limit (`2_000_000` iterations) rather than using asynchronous IRQ11 completion.
+
+### 3. JanusFS Storage & Crash Consistency Limitations
+- **Capacity & Layout**: Fixed 512-byte sectors (`CACHE_BLOCKS = 64`, `MAX_INODES = 64`, `MAX_DIRECT_BLOCKS = 5`, `MAX_FILE_SIZE = 2560` bytes, 16-byte filenames).
+- **Persistence vs. Power-Loss Atomicity**: Filesystem metadata and data persist across normal QEMU shutdown/reboot via VirtIO sector writes, and disk-full or synchronous I/O errors roll back cleanly in memory. However, JanusFS has **no journaling or copy-on-write**, so power loss mid-flush across multiple sectors is not crash-atomic.
+
+### 4. Userland Application Interface
 - **Constraint**: High-level C/Rust standard library support (`std`) is not available in Ring 3 userspace tasks.
-- **Impact**: Current userspace tasks (including storage driver tests) execute using custom `no_std` entrypoints and direct assembly register invocations (`syscall` ABI). High-level application support relies on WebAssembly AOT modules (planned for v3).
+- **Impact**: Current userspace tasks execute using custom `no_std` entrypoints and direct `syscall` ABI invocations. High-level application support (WASM AOT) is planned for future releases.
 
-### 3. Driver Fault Recovery
-- **Constraint**: If a Ring 3 userspace driver process triggers an unhandled memory fault or panic, the kernel safely isolates and terminates the task.
-- **Impact**: The driver process is shut down securely, but the system does not yet automatically restart the driver or re-bind its hardware IRQ endpoint. Dynamic driver restartability will be implemented in v2.
-
-### 4. Build Environment & OVMF EFI Path
-- **Constraint**: The default `Makefile` specifies the OVMF UEFI firmware path for Debian/Ubuntu systems (`/usr/share/ovmf/OVMF.fd`).
-- **Impact**: On non-Debian distributions (Fedora, Arch) or macOS, developers must specify the OVMF path explicitly when invoking make:
-  ```bash
-  make run OVMF=/path/to/OVMF.fd
-  ```
-
-### 5. Synchronous IPC Only
-- **Constraint**: IPC communication is currently strictly synchronous and blocking.
-- **Impact**: Senders block until receivers execute a corresponding `SYS_RECV` call. Asynchronous notification queues and unbuffered message channels are planned for v2.
+### 5. Driver Fault Recovery
+- **Constraint**: If a Ring 3 userspace driver process triggers an unhandled memory fault or exits, the kernel isolates the task, cleans its `CSpace`, and unmasks/unbinds any exclusively owned IRQ lines.
+- **Impact**: Automatic driver restartability is not yet implemented.

@@ -10,6 +10,7 @@ const PIC_EOI: u8 = 0x20;
 const ICW1_ICW4: u8 = 0x01; // ICW4 (not) needed
 const ICW1_INIT: u8 = 0x10; // Initialization - required!
 const ICW4_8086: u8 = 0x01; // 8086/88 (MCS-80/85) mode
+const PIC_READ_ISR: u8 = 0x0B; // OCW3 command to read In-Service Register
 
 #[inline(always)]
 unsafe fn outb(port: u16, val: u8) {
@@ -94,4 +95,26 @@ pub unsafe fn mask(irq: u8) {
     let port = if irq < 8 { PIC1_DATA } else { PIC2_DATA };
     let value = inb(port) | (1 << (irq % 8));
     outb(port, value);
+}
+
+/// Reads the In-Service Register (ISR) of the Master or Slave PIC.
+/// # Safety
+/// Caller must ensure single-threaded execution during interrupt handling.
+pub unsafe fn read_isr(pic2: bool) -> u8 {
+    let port = if pic2 { PIC2_COMMAND } else { PIC1_COMMAND };
+    outb(port, PIC_READ_ISR);
+    inb(port)
+}
+
+/// Checks if an IRQ is spurious (common on IRQ7 and IRQ15 under 8259 PIC).
+/// # Safety
+/// Caller must ensure single-threaded execution during interrupt handling.
+pub unsafe fn is_spurious(irq: u8) -> bool {
+    if irq == 7 {
+        (read_isr(false) & 0x80) == 0
+    } else if irq == 15 {
+        (read_isr(true) & 0x80) == 0
+    } else {
+        false
+    }
 }

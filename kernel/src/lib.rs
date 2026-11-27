@@ -1,15 +1,20 @@
 #![no_std]
+#![allow(static_mut_refs)]
 
 pub mod capability;
+pub mod console;
+pub mod fs;
 pub mod gdt;
 pub mod idt;
 pub mod ipc;
 pub mod memory;
+pub mod notification;
 pub mod paging;
 pub mod pci;
 pub mod pic;
 pub mod syscall;
 pub mod task;
+pub mod virtio_blk;
 
 pub struct SerialPort(pub u16);
 
@@ -23,31 +28,20 @@ impl core::fmt::Write for SerialPort {
 impl SerialPort {
     pub fn new(port: u16) -> Self {
         unsafe {
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") port + 1,
-                in("al") 0x00u8,
-            );
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") port + 3,
-                in("al") 0x80u8,
-            );
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") port,
-                in("al") 0x03u8,
-            );
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") port + 1,
-                in("al") 0x00u8,
-            );
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") port + 3,
-                in("al") 0x03u8,
-            );
+            // Disable all interrupts
+            core::arch::asm!("out dx, al", in("dx") port + 1, in("al") 0x00u8);
+            // Enable DLAB (set baud rate divisor)
+            core::arch::asm!("out dx, al", in("dx") port + 3, in("al") 0x80u8);
+            // Set divisor to 1 (lo byte) 115200 baud
+            core::arch::asm!("out dx, al", in("dx") port, in("al") 0x01u8);
+            //                  (hi byte)
+            core::arch::asm!("out dx, al", in("dx") port + 1, in("al") 0x00u8);
+            // 8 bits, no parity, one stop bit
+            core::arch::asm!("out dx, al", in("dx") port + 3, in("al") 0x03u8);
+            // Enable FIFO, clear TX/RX queues and set 14-byte threshold
+            core::arch::asm!("out dx, al", in("dx") port + 2, in("al") 0xC7u8);
+            // IRQs enabled, RTS/DSR set
+            core::arch::asm!("out dx, al", in("dx") port + 4, in("al") 0x0Bu8);
         }
         Self(port)
     }

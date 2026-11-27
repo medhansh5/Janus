@@ -12,6 +12,14 @@ pub enum TaskState {
     BlockedOnSend {
         endpoint: CPtr,
     },
+    /// Blocked waiting for an asynchronous event on the specified notification object
+    BlockedOnNotification {
+        notification_id: u16,
+    },
+    /// Blocked waiting for a timer deadline to expire
+    BlockedOnSleep {
+        wake_tick: u64,
+    },
     /// Terminated by the kernel due to a fault or security violation
     Terminated,
 }
@@ -88,6 +96,67 @@ pub fn current_task_id() -> Option<u64> {
     unsafe { CURRENT_TASK_ID }
 }
 
+/// Returns snapshot of task ID and state for diagnostic reporting.
+///
+/// # Safety
+/// Caller must ensure single-threaded execution in kernel mode.
+pub unsafe fn get_task_info(id: usize) -> Option<(u64, TaskState)> {
+    if id < MAX_TASKS {
+        TASKS[id].as_ref().map(|t| (t.id, t.state))
+    } else {
+        None
+    }
+}
+
+/// Wakes any tasks that are BlockedOnSleep whose deadline has expired.
+///
+/// # Safety
+/// Caller must ensure single-threaded execution with interrupts disabled.
+pub unsafe fn wake_sleeping_tasks(current_tick: u64) {
+    for task in TASKS.iter_mut().flatten() {
+        if let TaskState::BlockedOnSleep { wake_tick } = task.state {
+            if current_tick >= wake_tick {
+                task.state = TaskState::Runnable;
+            }
+        }
+    }
+}
+
+/// Terminates the current task, releases its CSpace, marks it Terminated, and yields.
+pub fn terminate_current_task(_exit_code: u64) -> ! {
+    unsafe {
+        if let Some(task_id) = current_task_id() {
+            crate::capability::destroy_task_cspace(task_id as u8);
+            if let Some(task) = current_task_mut() {
+                task.state = TaskState::Terminated;
+            }
+        }
+        schedule();
+        loop {
+            core::arch::asm!("hlt");
+        }
+    }
+}
+
+/// Syscall: Blocks the calling task for `duration_ms` milliseconds.
+pub fn sys_sleep(duration_ms: u64) -> u64 {
+    if duration_ms == 0 {
+        unsafe { schedule() };
+        return 0;
+    }
+    let current_tick = crate::idt::get_tick_count();
+    let wake_tick = current_tick.saturating_add(duration_ms);
+    {
+        let task = match unsafe { current_task_mut() } {
+            Some(t) => t,
+            None => return !0,
+        };
+        task.state = TaskState::BlockedOnSleep { wake_tick };
+    }
+    unsafe { schedule() };
+    0
+}
+
 /// # Safety
 /// Caller must ensure `task` has valid state and stack pointers.
 pub unsafe fn register_task(task: Task) {
@@ -156,35 +225,33 @@ pub unsafe fn schedule() {
     }
 
     // Perform context switch
+    #[allow(unused_variables)]
     let prev = get_task_mut(current_id).unwrap();
+    #[allow(unused_variables)]
     let next = get_task_mut(next_id).unwrap();
 
     CURRENT_TASK_ID = Some(next_id);
 
-    let mut serial = crate::SerialPort(0x3F8);
-    serial.write_str("[SCHEDULER] Switching from Task ");
-    serial.write_hex(current_id);
-    serial.write_str(" to Task ");
-    serial.write_hex(next_id);
-    serial.write_str("\n");
+    #[cfg(not(test))]
+    {
+        // Update TSS RSP0 to the new task's kernel stack (for interrupts)
+        crate::gdt::set_kernel_stack(next.kernel_stack_top);
 
-    // Update TSS RSP0 to the new task's kernel stack (for interrupts)
-    crate::gdt::set_kernel_stack(next.kernel_stack_top);
+        // Also update the scratch variable for `syscall`
+        unsafe {
+            crate::syscall::KERNEL_RSP_SCRATCH = next.kernel_stack_top;
+        }
 
-    // Also update the scratch variable for `syscall`
-    unsafe {
-        crate::syscall::KERNEL_RSP_SCRATCH = next.kernel_stack_top;
+        // Switch CR3 to the new task's page table
+        let _cr3_val = next.page_table.as_u64() | 0x3;
+        core::arch::asm!(
+            "mov cr3, {0}",
+            in(reg) next.page_table.as_u64(),
+            options(nostack)
+        );
+
+        switch_context(&mut prev.context, &next.context);
     }
-
-    // Switch CR3 to the new task's page table
-    let _cr3_val = next.page_table.as_u64() | 0x3; // PRESENT | WRITABLE? Actually CR3 doesn't need these flags, but some do. Just phys addr is fine.
-    core::arch::asm!(
-        "mov cr3, {0}",
-        in(reg) next.page_table.as_u64(),
-        options(nostack)
-    );
-
-    switch_context(&mut prev.context, &next.context);
 }
 
 /// # Safety

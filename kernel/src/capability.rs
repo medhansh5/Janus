@@ -68,6 +68,8 @@ pub enum CapType {
     MmioFrame = 6,
     IOPort = 7,
     Irq = 8,
+    Console = 9,
+    Storage = 10,
 }
 
 pub const UNMAPPED_VADDR: u64 = u64::MAX;
@@ -316,6 +318,14 @@ pub unsafe fn mint_cap_internal(
                 return Err(CapError::InvalidBadge);
             }
         }
+        CapType::Notification => {
+            if (new_badge & (1u64 << 63)) != 0 {
+                return Err(CapError::InvalidBadge);
+            }
+            if src_slot_ref.payload_b != 0 && new_badge != src_slot_ref.payload_b {
+                return Err(CapError::InvalidBadge);
+            }
+        }
         _ => {
             if new_badge != 0 {
                 return Err(CapError::InvalidBadge);
@@ -346,6 +356,11 @@ pub unsafe fn mint_cap_internal(
         return Err(CapError::CycleDetected);
     }
 
+    if src_slot_ref.cap_type == CapType::Notification {
+        let notif_id = (src_slot_ref.payload_a & 0xFFFF_FFFF) as usize;
+        crate::notification::increment_notification_ref(notif_id)?;
+    }
+
     let next_gen = dest_slot_ref.generation + 1;
 
     dest_slot_ref.cap_type = src_slot_ref.cap_type;
@@ -356,6 +371,13 @@ pub unsafe fn mint_cap_internal(
     dest_slot_ref.payload_b = match src_slot_ref.cap_type {
         CapType::Frame | CapType::MmioFrame => UNMAPPED_VADDR,
         CapType::Endpoint => {
+            if src_slot_ref.payload_b != 0 {
+                src_slot_ref.payload_b
+            } else {
+                new_badge
+            }
+        }
+        CapType::Notification => {
             if src_slot_ref.payload_b != 0 {
                 src_slot_ref.payload_b
             } else {
@@ -456,19 +478,28 @@ unsafe fn unlink_node(idx: usize) {
 }
 
 /// Cleans a revoked or deleted slot in a task's CNode.
-unsafe fn cleanup_slot(task_id: u8, slot: u8) {
+pub(crate) unsafe fn cleanup_slot(task_id: u8, slot: u8) {
     if let Ok(cnode) = get_task_cnode_mut(task_id) {
         let slot_ref = &mut cnode.slots[slot as usize];
-        if (slot_ref.cap_type == CapType::Frame || slot_ref.cap_type == CapType::MmioFrame)
+        let old_cap_type = slot_ref.cap_type;
+        let old_payload_a = slot_ref.payload_a;
+        if (old_cap_type == CapType::Frame || old_cap_type == CapType::MmioFrame)
             && slot_ref.payload_b != UNMAPPED_VADDR
         {
             slot_ref.payload_b = UNMAPPED_VADDR;
+        }
+        if old_cap_type == CapType::Notification {
+            let notif_id = (old_payload_a & 0xFFFF_FFFF) as usize;
+            crate::notification::decrement_notification_ref(notif_id);
         }
         slot_ref.cap_type = CapType::Empty;
         slot_ref.rights = CapRights::empty();
         slot_ref.payload_a = 0;
         slot_ref.payload_b = 0;
         slot_ref.generation = slot_ref.generation.saturating_add(1);
+        if old_cap_type == CapType::Irq {
+            crate::notification::cleanup_irq_on_cap_removal((old_payload_a & 0xFF) as u8);
+        }
     }
 }
 
@@ -754,6 +785,54 @@ pub fn validate_io_port_access(
     Ok(port)
 }
 
+/// Installs a root Notification capability directly into a task's empty CNode slot.
+///
+/// # Safety
+/// Caller must ensure thread-safe access to CNode and CDT structures across tasks.
+pub unsafe fn install_notification_root(
+    task_id: u8,
+    dest_slot: usize,
+    notif_id: usize,
+    object_gen: u32,
+) -> Result<CPtr, CapError> {
+    if task_id as usize >= MAX_TASKS {
+        return Err(CapError::InvalidTask);
+    }
+    if dest_slot >= CNODE_SLOTS {
+        return Err(CapError::OutOfBounds);
+    }
+    let cnode = get_task_cnode_mut(task_id)?;
+    let slot_ref = &mut cnode.slots[dest_slot];
+    if slot_ref.cap_type != CapType::Empty {
+        return Err(CapError::OccupiedSlot);
+    }
+    if slot_ref.generation == u32::MAX {
+        return Err(CapError::SlotExhausted);
+    }
+    let dest_idx = cdt_index(task_id, dest_slot as u8);
+    if CDT[dest_idx].parent.is_some()
+        || CDT[dest_idx].first_child.is_some()
+        || CDT[dest_idx].next_sibling.is_some()
+    {
+        return Err(CapError::CycleDetected);
+    }
+    let next_gen = slot_ref.generation + 1;
+    slot_ref.cap_type = CapType::Notification;
+    slot_ref.rights = CapRights::READ | CapRights::WRITE | CapRights::GRANT;
+    slot_ref._reserved1 = 0;
+    slot_ref.generation = next_gen;
+    slot_ref.payload_a = ((object_gen as u64) << 32) | (notif_id as u64);
+    slot_ref.payload_b = 0;
+    slot_ref.cdt_index = dest_idx as u32;
+    slot_ref._reserved2 = [0; 4];
+
+    CDT[dest_idx].parent = None;
+    CDT[dest_idx].first_child = None;
+    CDT[dest_idx].next_sibling = None;
+
+    Ok(CPtr::new(next_gen, dest_slot as u16))
+}
+
 /// Synchronously cleans up all CSpace slots and CDT links for a terminating task.
 ///
 /// # Safety
@@ -803,6 +882,26 @@ pub fn init_task_a_bootstrap_cnode(cnode_a: &mut CNode, shared_mem_paddr: u64) {
         payload_a: shared_mem_paddr,
         payload_b: UNMAPPED_VADDR,
         cdt_index: cdt_index(0, 3) as u32,
+        _reserved2: [0; 4],
+    };
+    cnode_a.slots[8] = CNodeSlot {
+        cap_type: CapType::Console,
+        rights: CapRights::READ | CapRights::WRITE | CapRights::GRANT,
+        _reserved1: 0,
+        generation: 1,
+        payload_a: 0,
+        payload_b: 0,
+        cdt_index: cdt_index(0, 8) as u32,
+        _reserved2: [0; 4],
+    };
+    cnode_a.slots[9] = CNodeSlot {
+        cap_type: CapType::Storage,
+        rights: CapRights::READ | CapRights::WRITE | CapRights::GRANT,
+        _reserved1: 0,
+        generation: 1,
+        payload_a: 0,
+        payload_b: 0,
+        cdt_index: cdt_index(0, 9) as u32,
         _reserved2: [0; 4],
     };
 }
@@ -878,10 +977,11 @@ pub fn init_task_b_bootstrap_cnode(
 }
 
 #[cfg(test)]
+pub static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
     unsafe fn setup_test_env() {
         TEST_CNODES = Some([CNode::empty(); MAX_TASKS]);
@@ -2193,6 +2293,62 @@ mod tests {
 
             // 5. Clean up for test isolation after comparison
             cnode.slots[2].cdt_index = cdt_index(0, 2) as u32;
+        }
+    }
+
+    #[test]
+    fn test_console_and_storage_capabilities() {
+        let _guard = TEST_LOCK.lock();
+        unsafe {
+            setup_test_env();
+            let cnode = get_task_cnode_mut(0).unwrap();
+            cnode.slots[8] = CNodeSlot {
+                cap_type: CapType::Console,
+                rights: CapRights::READ | CapRights::WRITE | CapRights::GRANT,
+                _reserved1: 0,
+                generation: 1,
+                payload_a: 0,
+                payload_b: 0,
+                cdt_index: cdt_index(0, 8) as u32,
+                _reserved2: [0; 4],
+            };
+            cnode.slots[9] = CNodeSlot {
+                cap_type: CapType::Storage,
+                rights: CapRights::READ | CapRights::WRITE | CapRights::GRANT,
+                _reserved1: 0,
+                generation: 1,
+                payload_a: 0,
+                payload_b: 0,
+                cdt_index: cdt_index(0, 9) as u32,
+                _reserved2: [0; 4],
+            };
+
+            // Test lookup
+            let c_console = CPtr::new(1, 8);
+            let slot_console = lookup_slot(0, c_console).unwrap();
+            assert_eq!(slot_console.cap_type, CapType::Console);
+            assert!(slot_console
+                .rights
+                .contains(CapRights::READ | CapRights::WRITE));
+
+            let c_storage = CPtr::new(1, 9);
+            let slot_storage = lookup_slot(0, c_storage).unwrap();
+            assert_eq!(slot_storage.cap_type, CapType::Storage);
+            assert!(slot_storage
+                .rights
+                .contains(CapRights::READ | CapRights::WRITE));
+
+            // Test minting with attenuated rights
+            let derived_cptr = mint_cap(0, c_storage, 10, CapRights::READ, 0).unwrap();
+            assert_eq!(derived_cptr.slot(), 10);
+            let derived_slot = lookup_slot(0, derived_cptr).unwrap();
+            assert_eq!(derived_slot.cap_type, CapType::Storage);
+            assert_eq!(derived_slot.rights, CapRights::READ);
+
+            // Test revocation
+            revoke_cap(0, c_storage).unwrap();
+            assert_eq!(lookup_slot(0, derived_cptr), Err(CapError::EmptySlot));
+            assert!(lookup_slot(0, c_storage).is_ok());
         }
     }
 }

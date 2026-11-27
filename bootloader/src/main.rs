@@ -50,9 +50,31 @@ fn main() -> Status {
     info!("================================");
 
     // 1. Load kernel.elf
-    let sfs_handle = uefi::boot::get_handle_for_protocol::<SimpleFileSystem>().unwrap();
-    let mut sfs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(sfs_handle).unwrap();
-    let mut root = sfs.open_volume().unwrap();
+    info!("Looking for SimpleFileSystem handle...");
+    let sfs_handle = match uefi::boot::get_handle_for_protocol::<SimpleFileSystem>() {
+        Ok(h) => h,
+        Err(e) => {
+            error!("get_handle_for_protocol error: {:?}", e);
+            return Status::LOAD_ERROR;
+        }
+    };
+    info!("Opening SimpleFileSystem protocol...");
+    let mut sfs = match uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(sfs_handle) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("open_protocol_exclusive error: {:?}", e);
+            return Status::LOAD_ERROR;
+        }
+    };
+    info!("Opening volume...");
+    let mut root = match sfs.open_volume() {
+        Ok(r) => r,
+        Err(e) => {
+            error!("open_volume error: {:?}", e);
+            return Status::LOAD_ERROR;
+        }
+    };
+    info!("Opening kernel.elf...");
 
     let mut kernel_file = match root.open(
         cstr16!("kernel.elf"),

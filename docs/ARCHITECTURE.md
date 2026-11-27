@@ -45,19 +45,19 @@ The system is strictly divided into three layers:
 
 Janus leverages x86_64 hardware system call instructions (`syscall` / `sysret`) for fast ring transitions between Ring 3 userspace and Ring 0 microkernel mode.
 
-### Syscall Register ABI
+### Syscall Register ABI (Actual V1.1 Implementation)
 
 | Register | Direction | Description |
 | -------- | --------- | ----------- |
-| `rax`    | Input     | System Call Identifier (`SYS_SEND`, `SYS_RECV`, `SYS_CALL`, `SYS_YIELD`) |
-| `rdi`    | Input     | Target Capability Pointer handle (`CPtr`) |
-| `rsi`    | Input     | IPC Message payload word 0 / transfer flag |
-| `rdx`    | Input     | IPC Message payload word 1 |
-| `r10`    | Input     | IPC Message payload word 2 |
-| `r8`     | Input     | Capability grant handle (optional `CPtr` to pass) |
-| `rax`    | Output    | System call result status / error code |
-| `rcx`    | Preserved | Saved user instruction pointer (`rip` restored by `sysret`) |
-| `r11`    | Preserved | Saved CPU flags (`rflags` restored by `sysret`) |
+| `rdi`    | Input     | System Call Number (`SYS_SEND=1`, ..., `SYS_READ_CONSOLE=24`..`SYS_FS_LIST=30`, `SYS_TASK_STATUS=32`) |
+| `rsi`    | Input     | Argument 1 (Capability Pointer `CPtr` for capability-gated syscalls) |
+| `rdx`    | Input     | Argument 2 |
+| `r10`    | Input     | Argument 3 (moved to `rcx` by `syscall_entry` for `sysv64` ABI) |
+| `r8`     | Input     | Argument 4 |
+| `r9`     | Input     | Argument 5 |
+| `rax`    | Output    | System call result or `!0` (`-1`) on error |
+| `rcx`    | Clobbered | Hardware-saved user `RIP` on `syscall` entry |
+| `r11`    | Clobbered | Hardware-saved user `RFLAGS` on `syscall` entry |
 
 ### Isolation Rules
 - **No Direct Memory Sharing**: Userspace cannot access kernel data structures directly. Memory addresses passed across syscall boundaries must be backed by a valid, mapped `Frame` capability.
@@ -89,11 +89,14 @@ Janus implements a kernel-managed **object-capability model** inspired by seL4.
 - **No Ambient Authority**: System resources (memory frames, IPC endpoints, I/O ports, interrupt lines) require an explicit capability handle in the process's `CSpace`.
 - **Capability Types**:
   - `Endpoint`: Synchronous, unbuffered IPC communication channel.
-  - `Untyped`: Unallocated physical memory frame range, mintable into typed capabilities.
-  - `CNode`: Capability table storing slot mappings for a process.
-  - `Frame`: Physical 4KB memory page for address space mapping or hardware DMA.
+  - `Notification`: Asynchronous 64-bit coalescing event bitmask object.
+  - `Untyped`: Unallocated physical memory frame range.
+  - `CNode`: Capability table storing 128 slots per task.
+  - `Frame` / `MmioFrame`: Physical 4KB memory/MMIO page with W^X enforcement.
   - `IOPort`: x86 I/O port range access bitmask (scoped strictly to device BARs).
-  - `InterruptEndpoint`: Specialized endpoint signaled directly by hardware device IRQs.
+  - `Irq`: Hardware IRQ line (0..15) capability for binding and single-EOI acknowledgement.
+  - `Console`: Capability gating COM1/PS2 console reads (`READ`) and writes (`WRITE`).
+  - `Storage`: Capability gating JanusFS operations (`READ` / `WRITE`).
 
 ### Capability Revocation Semantics
 Revocation in Janus is instantaneous and cascading:

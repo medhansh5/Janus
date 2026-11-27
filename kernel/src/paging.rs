@@ -460,6 +460,76 @@ pub fn copy_from_user(user_vaddr: u64, buf: &mut [u8]) -> Result<(), UserCopyErr
     copy_from_user_with_reader(&reader, pml4, user_vaddr, buf)
 }
 
+/// Safely copies `buf.len()` bytes from kernel buffer `buf` into user virtual address `user_vaddr`
+/// in the active address space (from CR3).
+pub fn copy_to_user(user_vaddr: u64, buf: &[u8]) -> Result<(), UserCopyError> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    if user_vaddr == 0 {
+        return Err(UserCopyError::NullPointer);
+    }
+    let end_vaddr = user_vaddr
+        .checked_add(buf.len() as u64)
+        .ok_or(UserCopyError::ArithmeticOverflow)?;
+
+    if user_vaddr >= KERNEL_SPACE_START || end_vaddr > KERNEL_SPACE_START {
+        return Err(UserCopyError::KernelAddress);
+    }
+    if user_vaddr >= USER_SPACE_END || end_vaddr > USER_SPACE_END {
+        return Err(UserCopyError::NonCanonical);
+    }
+
+    let cr3_frame = x86_64::registers::control::Cr3::read().0;
+    let pml4_paddr = cr3_frame.start_address().as_u64();
+    let reader = KernelDirectMap;
+    let pml4 = reader.read_table(pml4_paddr)?;
+
+    let total_len = buf.len();
+
+    // Phase 1: Pre-validation
+    let mut check_offset = 0usize;
+    while check_offset < total_len {
+        let curr_vaddr = user_vaddr
+            .checked_add(check_offset as u64)
+            .ok_or(UserCopyError::ArithmeticOverflow)?;
+        let trans = translate_user_page(&reader, pml4, curr_vaddr)?;
+        let remaining_in_page = (trans.page_size - trans.page_offset) as usize;
+        let chunk_size = core::cmp::min(remaining_in_page, total_len - check_offset);
+        check_offset += chunk_size;
+    }
+
+    // Phase 2: Copy
+    let mut copied = 0usize;
+    while copied < total_len {
+        let curr_vaddr = user_vaddr
+            .checked_add(copied as u64)
+            .ok_or(UserCopyError::ArithmeticOverflow)?;
+        let trans = translate_user_page(&reader, pml4, curr_vaddr)?;
+        let remaining_in_page = (trans.page_size - trans.page_offset) as usize;
+        let chunk_size = core::cmp::min(remaining_in_page, total_len - copied);
+
+        let dest_phys = trans
+            .phys_base
+            .checked_add(trans.page_offset)
+            .ok_or(UserCopyError::ArithmeticOverflow)?;
+        let dest_vaddr = dest_phys
+            .checked_add(PHYS_MEMORY_OFFSET)
+            .ok_or(UserCopyError::ArithmeticOverflow)?;
+
+        unsafe {
+            core::ptr::copy(
+                buf[copied..copied + chunk_size].as_ptr(),
+                dest_vaddr as *mut u8,
+                chunk_size,
+            );
+        }
+        copied += chunk_size;
+    }
+
+    Ok(())
+}
+
 /// Reads a 4-byte `u32` value from the user virtual address in the active address space.
 ///
 /// Uses `copy_from_user` to validate and read the 4-byte sequence.

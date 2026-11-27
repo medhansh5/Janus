@@ -43,25 +43,18 @@
 
 ## Feature Maturity Classification
 
-### Implemented & Validated Functionality (v1.0 Milestone)
-- **Ring 3 Storage Driver**: Virtio-Blk hardware driver executing entirely in unprivileged userspace, communicating with the kernel via capability handles.
-- **Hardware IRQ Routing**: Device interrupts converted by the microkernel into asynchronous notifications routed via `InterruptEndpoint` capabilities.
-- **Scoped PCI Isolation**: `IOPort` capabilities restricted by port bitmasks so drivers access only their assigned Base Address Registers (BARs).
-- **Contiguous DMA Allocator**: Kernel memory provisioning of contiguous physical memory frames for hardware DMA buffers.
-- **Preemptive IRQ0 Scheduler**: Hardware timer-driven scheduler with dedicated Ring 0 idle task handling empty runqueues.
-- **Capability Memory Safety**: Physical frame allocator respecting bootloader reserved regions and vending pages via typed `CSpace` entries.
-- **Synchronous IPC**: Fast blocking inter-process communication with dynamic capability passing.
-- **Security Fault Isolation**: Unauthorized operations (e.g., accessing unowned `Frame` or invalid `CPtr` handles) trigger kernel security faults and terminate offending processes cleanly.
-
-### Experimental Functionality
-- **Dynamic Init Capability Policy**: Line-based static manifest parsing in `init` (`docs/INIT-POLICY.md`) to partition root capabilities to services.
-- **Userspace Virtio Request Queues**: Ring 3 assembly request ring buffer handling for block storage read/write operations.
+### Implemented & Validated Functionality (v1.1.1)
+- **Capability-Gated System Services**: Console I/O (syscalls 24–25) and JanusFS storage (syscalls 26–30) require explicit `CapType::Console` / `CapType::Storage` capabilities with `READ`/`WRITE` rights.
+- **Persistent JanusFS on Legacy VirtIO-Blk**: Kernel legacy VirtIO 0.9.5 block driver (`0x1AF4:0x1001`, I/O BAR0, 256-entry VirtQueue, synchronous polling with bounded timeout) backing JanusFS sector persistence across reboots with transactional allocation rollback on disk-full or I/O errors.
+- **Hardware IRQ Routing & Single-EOI Protocol**: Dual 8259 PIC vectors 32–47 with spurious IRQ7/IRQ15 handling, IDT masking + single EOI, `CapType::Irq` + `CapRights::WRITE` acknowledgement, asynchronous `Notification` delivery, and automatic IRQ unbind/unmask cleanup on last-owner destruction.
+- **Contiguous DMA & W^X Memory Safety**: Higher-half paging, isolated user PML4s, and `copy_from_user`/`copy_to_user` pre-validation.
+- **Preemptive IRQ0 Scheduler & Ring 3 Interactive Shell**: 1000 Hz PIT timer scheduler, Ring 3 shell (`help`, `ps`, `ls`, `cat`, `write`, `rm`, `time`, `echo`, `test`, `clear`, `exit`).
 
 ### Planned Functionality
 - **WASM Application Runtime**: Sandboxed Ahead-Of-Time (AOT) WebAssembly application execution.
-- **Driver Panic Recovery**: Automatic restartability and capability re-binding for crashed userspace drivers.
-- **Virtual File System (VFS)**: Isolated Ring 3 file storage service and mount manager.
-- **Multi-Core Support (SMP)**: x2APIC migration, Inter-Processor Interrupts (IPI), and multi-core scheduling.
+- **Asynchronous IRQ-Driven Block I/O & Modern VirtIO / NVMe**.
+- **Crash-Consistent Journaling / CoW Filesystem**.
+- **Multi-Core Support (SMP)**: x2APIC migration, per-CPU `swapgs` stacks, IPIs, and multi-core scheduling.
 
 ---
 

@@ -57,8 +57,19 @@ extern "C" {
     fn general_protection_fault_stub();
     fn page_fault_stub();
     fn timer_stub();
+    fn irq1_stub();
+    fn irq2_stub();
+    fn irq3_stub();
+    fn irq4_stub();
+    fn irq5_stub();
+    fn irq6_stub();
+    fn irq7_stub();
+    fn irq8_stub();
+    fn irq9_stub();
     fn irq10_stub();
     fn irq11_stub();
+    fn irq12_stub();
+    fn irq13_stub();
     fn irq14_stub();
     fn irq15_stub();
 }
@@ -73,12 +84,21 @@ pub fn init() {
         IDT[13].set_handler_fn(general_protection_fault_stub as *const () as usize as u64); // #GP
         IDT[14].set_handler_fn(page_fault_stub as *const () as usize as u64); // #PF
 
-        // We will add the Timer handler here later (Vector 32)
-        IDT[32].set_handler_fn(timer_stub as *const () as usize as u64); // IRQ0 (Timer)
-
-        // IRQ10, IRQ11, IRQ14, IRQ15 (virtio-blk might be any of these)
+        // Hardware IRQ handlers (Vectors 32..47 -> IRQ 0..15)
+        IDT[32].set_handler_fn(timer_stub as *const () as usize as u64);
+        IDT[33].set_handler_fn(irq1_stub as *const () as usize as u64);
+        IDT[34].set_handler_fn(irq2_stub as *const () as usize as u64);
+        IDT[35].set_handler_fn(irq3_stub as *const () as usize as u64);
+        IDT[36].set_handler_fn(irq4_stub as *const () as usize as u64);
+        IDT[37].set_handler_fn(irq5_stub as *const () as usize as u64);
+        IDT[38].set_handler_fn(irq6_stub as *const () as usize as u64);
+        IDT[39].set_handler_fn(irq7_stub as *const () as usize as u64);
+        IDT[40].set_handler_fn(irq8_stub as *const () as usize as u64);
+        IDT[41].set_handler_fn(irq9_stub as *const () as usize as u64);
         IDT[42].set_handler_fn(irq10_stub as *const () as usize as u64);
         IDT[43].set_handler_fn(irq11_stub as *const () as usize as u64);
+        IDT[44].set_handler_fn(irq12_stub as *const () as usize as u64);
+        IDT[45].set_handler_fn(irq13_stub as *const () as usize as u64);
         IDT[46].set_handler_fn(irq14_stub as *const () as usize as u64);
         IDT[47].set_handler_fn(irq15_stub as *const () as usize as u64);
 
@@ -121,9 +141,80 @@ core::arch::global_asm!(
 core::arch::global_asm!(
     ".global timer_stub",
     "timer_stub:",
-    // Hardware DOES NOT push an error code for IRQ0
-    "push 0",  // Dummy error code
-    "push 32", // Push vector number
+    "push 0",
+    "push 32",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq1_stub",
+    "irq1_stub:",
+    "push 0",
+    "push 33",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq2_stub",
+    "irq2_stub:",
+    "push 0",
+    "push 34",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq3_stub",
+    "irq3_stub:",
+    "push 0",
+    "push 35",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq4_stub",
+    "irq4_stub:",
+    "push 0",
+    "push 36",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq5_stub",
+    "irq5_stub:",
+    "push 0",
+    "push 37",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq6_stub",
+    "irq6_stub:",
+    "push 0",
+    "push 38",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq7_stub",
+    "irq7_stub:",
+    "push 0",
+    "push 39",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq8_stub",
+    "irq8_stub:",
+    "push 0",
+    "push 40",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq9_stub",
+    "irq9_stub:",
+    "push 0",
+    "push 41",
     "jmp exception_common"
 );
 
@@ -140,6 +231,22 @@ core::arch::global_asm!(
     "irq11_stub:",
     "push 0",
     "push 43",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq12_stub",
+    "irq12_stub:",
+    "push 0",
+    "push 44",
+    "jmp exception_common"
+);
+
+core::arch::global_asm!(
+    ".global irq13_stub",
+    "irq13_stub:",
+    "push 0",
+    "push 45",
     "jmp exception_common"
 );
 
@@ -235,6 +342,10 @@ pub struct ExceptionFrame {
 
 static mut TICK_COUNT: u64 = 0;
 
+pub fn get_tick_count() -> u64 {
+    unsafe { TICK_COUNT }
+}
+
 /// Main exception handling dispatcher.
 ///
 /// # Safety
@@ -244,32 +355,43 @@ pub unsafe extern "C" fn exception_handler(frame: *const ExceptionFrame) {
     let frame = &*frame;
 
     if frame.vector == 32 {
-        // Timer Interrupt
+        // Timer Interrupt (IRQ 0)
         unsafe {
-            TICK_COUNT += 1;
+            TICK_COUNT = TICK_COUNT.wrapping_add(1);
+
+            crate::task::wake_sleeping_tasks(TICK_COUNT);
+
+            #[cfg(not(test))]
+            crate::console::poll_input();
 
             crate::pic::end_of_interrupt(0);
 
-            // Force preemption immediately for the test
             crate::task::schedule();
         }
         return;
-    } else if (42..=47).contains(&frame.vector) {
-        // IRQ10=42, IRQ11=43, IRQ14=46, IRQ15=47
-        let irq_num = frame.vector - 32;
-
-        let mut serial = crate::SerialPort(0x3F8);
-        serial.write_str("[KERNEL IRQ] Fired IRQ ");
-        serial.write_hex(irq_num);
-        serial.write_str("\n");
+    } else if (33..=47).contains(&frame.vector) {
+        let irq_num = (frame.vector - 32) as u8;
 
         unsafe {
-            crate::pic::end_of_interrupt(irq_num as u8);
+            if crate::pic::is_spurious(irq_num) {
+                if irq_num == 15 {
+                    crate::pic::end_of_interrupt(7);
+                }
+                return;
+            }
+
+            #[cfg(not(test))]
+            if irq_num == 1 || irq_num == 4 {
+                crate::console::poll_input();
+            }
+
+            crate::notification::handle_hardware_irq(irq_num);
+            crate::ipc::wake_irq(irq_num);
+
+            crate::pic::mask(irq_num);
+            crate::notification::mark_irq_masked(irq_num);
+            crate::pic::end_of_interrupt(irq_num);
         }
-
-        // Wake tasks waiting on this IRQ
-        crate::ipc::wake_irq(irq_num as u8);
-
         return;
     }
 

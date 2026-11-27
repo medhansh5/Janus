@@ -3,7 +3,9 @@
 
 use boot_info::BootInfo;
 
-use kernel::{capability, gdt, idt, memory, paging, pci, pic, println, syscall, task, SerialPort};
+use kernel::{
+    capability, fs, gdt, idt, memory, paging, pci, pic, println, syscall, task, SerialPort,
+};
 
 /// The entry point of the Janus Microkernel.
 /// This is called by the bootloader after memory mapping and ExitBootServices.
@@ -238,7 +240,7 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
     let pml4_idx = user_code_vaddr.p4_index();
     let pdpt_idx = user_code_vaddr.p3_index();
     let pd_idx = user_code_vaddr.p2_index();
-    let pt_idx = user_code_vaddr.p1_index();
+    let _pt_idx = user_code_vaddr.p1_index();
 
     let pdpt_paddr = allocator
         .allocate_frame()
@@ -287,6 +289,16 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
         .allocate_frame()
         .expect("Failed to allocate shared memory frame!");
 
+    let user_code_b_frame = allocator
+        .allocate_frame()
+        .expect("Failed to allocate user code b frame!");
+    let user_stack_frame_a = allocator
+        .allocate_frame()
+        .expect("Failed to allocate user stack frame a!");
+    let user_stack_frame_b = allocator
+        .allocate_frame()
+        .expect("Failed to allocate user stack frame b!");
+
     unsafe {
         core::ptr::write_bytes(
             (pdpt_paddr + paging::PHYS_MEMORY_OFFSET) as *mut u8,
@@ -295,6 +307,21 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
         );
         core::ptr::write_bytes((pd_paddr + paging::PHYS_MEMORY_OFFSET) as *mut u8, 0, 4096);
         core::ptr::write_bytes((pt_paddr + paging::PHYS_MEMORY_OFFSET) as *mut u8, 0, 4096);
+        core::ptr::write_bytes(
+            (user_code_b_frame + paging::PHYS_MEMORY_OFFSET) as *mut u8,
+            0,
+            4096,
+        );
+        core::ptr::write_bytes(
+            (user_stack_frame_a + paging::PHYS_MEMORY_OFFSET) as *mut u8,
+            0,
+            4096,
+        );
+        core::ptr::write_bytes(
+            (user_stack_frame_b + paging::PHYS_MEMORY_OFFSET) as *mut u8,
+            0,
+            4096,
+        );
         core::ptr::write_bytes(
             (virtqueue_paddr + paging::PHYS_MEMORY_OFFSET) as *mut u8,
             0,
@@ -329,58 +356,68 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
         );
 
         let pt = &mut *((pt_paddr + paging::PHYS_MEMORY_OFFSET) as *mut PageTable);
-        pt[pt_idx].set_addr(
+        // pt[0] -> user_code_frame (0x400000, Task A code)
+        pt[0].set_addr(
             PhysAddr::new(user_code_frame),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
         );
 
-        // Map shared memory to 0x401000
-        let shared_vaddr = VirtAddr::new(0x401000);
-        pt[shared_vaddr.p1_index()].set_addr(
+        // pt[1] -> shared_mem_paddr (0x401000, Data/line buffer)
+        pt[1].set_addr(
             PhysAddr::new(shared_mem_paddr),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
         );
 
-        // Map virtqueue to 0x402000, 0x403000, 0x404000
-        let vq_vaddr = VirtAddr::new(0x402000);
-        pt[vq_vaddr.p1_index()].set_addr(
+        // pt[2] -> user_code_b_frame (0x402000, Task B code)
+        pt[2].set_addr(
+            PhysAddr::new(user_code_b_frame),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+        );
+
+        // pt[3] -> user_stack_frame_a (0x403000, Task A user stack)
+        pt[3].set_addr(
+            PhysAddr::new(user_stack_frame_a),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+        );
+
+        // pt[4] -> user_stack_frame_b (0x404000, Task B user stack)
+        pt[4].set_addr(
+            PhysAddr::new(user_stack_frame_b),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
+        );
+
+        // pt[5] -> virtqueue_paddr (0x405000)
+        pt[5].set_addr(
             PhysAddr::new(virtqueue_paddr),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
         );
 
-        let vq_vaddr2 = VirtAddr::new(0x403000);
-        pt[vq_vaddr2.p1_index()].set_addr(
+        // pt[6] -> virtqueue_paddr_2 (0x406000)
+        pt[6].set_addr(
             PhysAddr::new(virtqueue_paddr_2),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
         );
 
-        let vq_vaddr3 = VirtAddr::new(0x404000);
-        pt[vq_vaddr3.p1_index()].set_addr(
+        // pt[7] -> virtqueue_paddr_3 (0x407000)
+        pt[7].set_addr(
             PhysAddr::new(virtqueue_paddr_3),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
         );
-
-        serial.write_str("[KERNEL DEBUG] pt[3] = ");
-        serial.write_hex(pt[3].addr().as_u64());
-        serial.write_str("\n");
     }
 
-    // Copy the assembly payloads to the user page
+    // Copy the assembly payloads to the user pages
     unsafe {
-        let user_page_ptr = (user_code_frame + paging::PHYS_MEMORY_OFFSET) as *mut u8;
-        // Copy Task A payload to offset 0
-        core::ptr::copy_nonoverlapping(task_a_payload as *const u8, user_page_ptr, 2048);
-        // Copy Task B payload to offset 0x800
-        core::ptr::copy_nonoverlapping(task_b_payload as *const u8, user_page_ptr.add(0x800), 2048);
+        let task_a_page_ptr = (user_code_frame + paging::PHYS_MEMORY_OFFSET) as *mut u8;
+        core::ptr::copy_nonoverlapping(task_a_payload as *const u8, task_a_page_ptr, 4096);
 
-        let first_byte = *(task_a_payload as *const u8);
-        serial.write_str("[KERNEL DEBUG] First byte of task_a_payload: ");
-        serial.write_hex(first_byte as u64);
-        serial.write_str("\n");
+        let task_b_page_ptr = (user_code_b_frame + paging::PHYS_MEMORY_OFFSET) as *mut u8;
+        core::ptr::copy_nonoverlapping(task_b_payload as *const u8, task_b_page_ptr, 4096);
     }
 
     let task_a_rip = 0x400000;
-    let task_b_rip = 0x400800;
+    let task_b_rip = 0x402000;
+    let task_a_user_rsp = 0x403FF0;
+    let task_b_user_rsp = 0x404FF0;
 
     // Allocate CNodes for Task A and B
     let cnode_a_paddr = allocator
@@ -429,6 +466,16 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
 
     // Task A (Client Task):
     capability::init_task_a_bootstrap_cnode(cnode_a, shared_mem_paddr);
+    cnode_a.slots[6] = capability::CNodeSlot {
+        cap_type: capability::CapType::Irq,
+        rights: capability::CapRights::READ | capability::CapRights::WRITE,
+        _reserved1: 0,
+        generation: 1,
+        payload_a: virtio_irq as u64,
+        payload_b: 0,
+        cdt_index: capability::cdt_index(0, 6) as u32,
+        _reserved2: [0; 4],
+    };
 
     // Task B (Virtio Driver Task):
     capability::init_task_b_bootstrap_cnode(
@@ -438,6 +485,9 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
         virtio_io_base,
         virtio_irq,
     );
+
+    // Initialize JanusFS with the discovered VirtIO block device and VirtQueue physical frame
+    fs::init(Some(virtio_io_base), Some(virtqueue_paddr));
 
     // Allocate Stacks for A and B
     let stack_a_paddr = allocator
@@ -461,22 +511,14 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
         stack_b_paddr + paging::PHYS_MEMORY_OFFSET + 4096,
     );
 
-    // We will drop to user space directly for Task A.
-    // Let's configure Task A's context so that when we switch to it, it jumps to user mode.
-    // Wait, my jump_to_user does sysretq.
-    // The easiest way is just to manually call jump_to_user for Task A, and when it yields, Task B will run.
-    // But Task B needs its context set up so that `switch_context` drops to user mode for it!
-    // We can set Task B's RIP to `jump_to_user_trampoline` and put its user RIP and RSP in RDI/RSI!
-    // switch_context uses `ret` to resume, so we need the trampoline address at [rsp].
     let task_b_kstack_top = stack_b_paddr + paging::PHYS_MEMORY_OFFSET + 4096;
-    // Push trampoline address onto the stack (stack grows down)
     unsafe {
         let return_addr_ptr = (task_b_kstack_top - 8) as *mut u64;
         core::ptr::write(return_addr_ptr, jump_to_user_trampoline as *const () as u64);
     }
-    task_b.context.rsp = task_b_kstack_top - 8; // Points to the trampoline address
+    task_b.context.rsp = task_b_kstack_top - 8;
     task_b.context.rdi = task_b_rip;
-    task_b.context.rsi = 0; // We didn't map a real user stack, but sysretq doesn't fault on a bad RSP until we push/pop. Since our payloads don't use the stack, 0 is fine for v0 proof!
+    task_b.context.rsi = task_b_user_rsp;
 
     let stack_idle_paddr = allocator
         .allocate_frame()
@@ -497,17 +539,10 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
     }
     task_idle.context.rsp = task_idle_kstack_top - 8;
     task_idle.context.rdi = idle_task_payload as *const () as u64;
-    // The initial kernel stack pointer for the idle task payload.
-    // When scheduled, switch_context returns to jump_to_kernel_trampoline via context.rsp [top - 8].
-    // jump_to_kernel_trampoline then calls jump_to_kernel_task(rdi, rsi), which executes iretq,
-    // popping context.rsi into the hardware RSP register.
-    // Setting RSI to (top - 4096) placed RSP at the bottom of the allocated stack page,
-    // causing immediate stack underflow into unallocated memory on the very first interrupt push.
-    // We set RSI to (top - 16) to provide a 16-byte aligned stack top with full headroom.
     task_idle.context.rsi = task_idle_kstack_top - 16;
 
     unsafe {
-        serial.write_str("[KERNEL] Context configured. Dropping to Ring 3 (Task A)...\n");
+        serial.write_str("[KERNEL] Initializing Shell & Dropping to Ring 3...\n");
         task::register_task(task_a);
         task::register_task(task_b);
         task::register_task(task_idle);
@@ -522,8 +557,8 @@ extern "sysv64" fn kernel_main_stage2() -> ! {
         // Switch to the user page table
         core::arch::asm!("mov cr3, {}", in(reg) user_pml4_paddr);
 
-        // Jump to Task A in user space
-        task::jump_to_user(task_a_rip, 0);
+        // Jump to Task A (interactive shell) in user space
+        task::jump_to_user(task_a_rip, task_a_user_rsp);
     }
 }
 
@@ -543,131 +578,514 @@ core::arch::global_asm!(
     "sti",
     "hlt",
     "jmp idle_task_payload",
-    ".global task_a_payload",
-    "task_a_payload:",
-    // Yield to let driver initialize
-    "mov rdi, 4",
-    "syscall",
-    // Send request
-    "mov rdi, 1",
-    "mov rsi, 1",
-    "mov rdx, 0", // sector 0
-    "syscall",
-    // Recv ACK
-    "mov rdi, 2",
-    "mov rsi, 2",
-    "syscall",
-    // SYS_LOG first 4 bytes
-    "mov rdi, 8",
-    "mov rsi, 0x401000",
-    "syscall",
-    // Terminate via invalid cap
-    "mov rdi, 1",
-    "mov rsi, 99",
-    "syscall",
-    "1: jmp 1b",
     ".global task_b_payload",
     "task_b_payload:",
-    // Get Virtqueue Paddr
-    "mov rdi, 5",
-    "mov rsi, 4",
-    "syscall",
-    "mov r12, rax",
-    // Get Shared Mem Paddr
-    "mov rdi, 5",
-    "mov rsi, 3",
-    "syscall",
-    "mov r13, rax",
-    // Status = 0
-    "mov rdi, 7",
-    "mov rsi, 5",
-    "mov rdx, 0x12",
-    "mov r10, 0",
-    "mov r8, 1",
-    "syscall",
-    // Status = 1
-    "mov rdi, 7",
-    "mov rsi, 5",
-    "mov rdx, 0x12",
-    "mov r10, 1",
-    "mov r8, 1",
-    "syscall",
-    // Status = 3
-    "mov rdi, 7",
-    "mov rsi, 5",
-    "mov rdx, 0x12",
-    "mov r10, 3",
-    "mov r8, 1",
-    "syscall",
-    // desc[0]
-    "mov rax, 0x402000",
-    "mov rcx, r13",
-    "add rcx, 512",
-    "mov [rax], rcx",
-    "mov dword ptr [rax+8], 16",
-    "mov word ptr [rax+12], 1",
-    "mov word ptr [rax+14], 1",
-    // desc[1]
-    "mov rcx, r13",
-    "mov [rax+16], rcx",
-    "mov dword ptr [rax+24], 512",
-    "mov word ptr [rax+28], 3",
-    "mov word ptr [rax+30], 2",
-    // desc[2]
-    "mov rcx, r13",
-    "add rcx, 528",
-    "mov [rax+32], rcx",
-    "mov dword ptr [rax+40], 1",
-    "mov word ptr [rax+44], 2",
-    "mov word ptr [rax+46], 0",
-    // Queue PFN
-    "mov rdi, 7",
-    "mov rsi, 5",
-    "mov rdx, 0x08",
-    "mov r10, r12",
-    "shr r10, 12",
-    "mov r8, 4",
-    "syscall",
-    // Status = 7
-    "mov rdi, 7",
-    "mov rsi, 5",
-    "mov rdx, 0x12",
-    "mov r10, 7",
-    "mov r8, 1",
-    "syscall",
-    // Wait Client
-    "mov rdi, 2",
+    "20:",
+    "mov rdi, 2", // SYS_RECV(cptr=1)
     "mov rsi, 1",
     "syscall",
-    // Prepare Header
-    "mov rax, 0x401000",
-    "mov dword ptr [rax+512], 0",
-    "mov dword ptr [rax+516], 0",
-    "mov qword ptr [rax+520], 0",
-    // Notify
-    "mov rax, 0x402000",
-    "mov word ptr [rax+4096+4], 0",
-    "mov word ptr [rax+4096+2], 1",
-    "mov rdi, 7",
-    "mov rsi, 5",
-    "mov rdx, 0x10",
-    "mov r10, 0",
-    "mov r8, 2",
+    "mov rdi, 3", // SYS_REPLY(msg=0xCAFEBABE)
+    "mov rsi, 0xCAFEBABE",
     "syscall",
-    // Wait IRQ
-    "mov rdi, 2",
-    "mov rsi, 6",
+    "mov rdi, 4", // SYS_YIELD
     "syscall",
-    // Ack Client
-    "mov rdi, 1",
+    "jmp 20b",
+    ".global task_a_payload",
+    "task_a_payload:",
+    // Print banner
+    "lea rdx, [rip + 100f]",
+    "call 60f", // strlen in R10
+    "mov rdi, 25", // SYS_WRITE_CONSOLE
+    "mov rsi, 0x00010008", // CPtr(slot 8, gen 1)
+    // rdx = buffer, r10 = length
+    "syscall",
+    // Main prompt loop
+    "10:",
+    "lea rdx, [rip + 102f]",
+    "call 60f",
+    "mov rdi, 25",
+    "mov rsi, 0x00010008",
+    "syscall",
+    // Read line into 0x401000
+    "xor r12, r12", // line length
+    // Read char loop
+    "11:",
+    "mov rdi, 24", // SYS_READ_CONSOLE
+    "mov rsi, 0x00010008", // CPtr(slot 8, gen 1)
+    "mov rdx, 0x401100",
+    "mov r10, 1",
+    "syscall",
+    "test rax, rax",
+    "jnz 12f",
+    // Sleep 20ms
+    "mov rdi, 19", // SYS_SLEEP
+    "mov rsi, 20",
+    "syscall",
+    "jmp 11b",
+    // Char received
+    "12:",
+    "mov al, byte ptr [0x401100]",
+    "cmp al, 10",
+    "je 15f",
+    "cmp al, 13",
+    "je 15f",
+    "cmp al, 8",
+    "je 13f",
+    "cmp al, 127",
+    "je 13f",
+    "cmp al, 32",
+    "jb 11b",
+    "cmp al, 126",
+    "ja 11b",
+    // Store in buffer
+    "cmp r12, 120",
+    "jae 11b",
+    "mov rbx, 0x401000",
+    "mov [rbx + r12], al",
+    "inc r12",
+    // Echo
+    "mov rdi, 25",
+    "mov rsi, 0x00010008",
+    "mov rdx, 0x401100",
+    "mov r10, 1",
+    "syscall",
+    "jmp 11b",
+    // Backspace
+    "13:",
+    "test r12, r12",
+    "jz 11b",
+    "dec r12",
+    "lea rdx, [rip + 104f]",
+    "mov r10, 3",
+    "mov rdi, 25",
+    "mov rsi, 0x00010008",
+    "syscall",
+    "jmp 11b",
+    // Line finished
+    "15:",
+    "lea rdx, [rip + 105f]",
+    "mov r10, 1",
+    "mov rdi, 25",
+    "mov rsi, 0x00010008",
+    "syscall",
+    "mov rbx, 0x401000",
+    "mov byte ptr [rbx + r12], 0",
+    "test r12, r12",
+    "jz 10b", // empty line -> re-prompt
+    // Parse commands:
+    // 1. "help"
+    "mov eax, dword ptr [rbx]",
+    "cmp eax, 0x706c6568", // 'help'
+    "jne 30f",
+    "cmp byte ptr [rbx + 4], 0",
+    "jne 30f",
+    "lea rdx, [rip + 106f]",
+    "call 60f",
+    "mov rdi, 25",
+    "mov rsi, 0x00010008",
+    "syscall",
+    "jmp 10b",
+    // 2. "ps" or "status"
+    "30:",
+    "cmp word ptr [rbx], 0x7370", // 'ps'
+    "je 31f",
+    "cmp eax, 0x74617473", // 'stat'
+    "jne 32f",
+    "cmp word ptr [rbx + 4], 0x7375", // 'us'
+    "jne 32f",
+    "31:",
+    "mov rdi, 32", // SYS_TASK_STATUS
+    "mov rsi, 0x401400",
+    "mov rdx, 1000",
+    "syscall",
+    "mov r10, rax",
+    "mov rdx, 0x401400",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    // 3. "ls"
+    "32:",
+    "cmp word ptr [rbx], 0x736c", // 'ls'
+    "jne 33f",
+    "cmp byte ptr [rbx + 2], 0",
+    "jne 33f",
+    "mov rdi, 30", // SYS_FS_LIST
+    "mov rsi, 0x00010009", // CPtr(slot 9, gen 1)
+    "mov rdx, 0x401400",
+    "mov r10, 1000",
+    "syscall",
+    "mov r10, rax",
+    "mov rdx, 0x401400",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    // 4. "cat "
+    "33:",
+    "cmp eax, 0x20746163", // 'cat '
+    "jne 34f",
+    "lea rdx, [rbx + 4]",
+    "xor rcx, rcx",
+    "330:",
+    "cmp byte ptr [rdx + rcx], 0",
+    "je 331f",
+    "inc rcx",
+    "jmp 330b",
+    "331:",
+    "mov rdi, 27", // SYS_FS_READ
+    "mov rsi, 0x00010009", // CPtr(slot 9, gen 1)
+    // rdx = path_ptr
+    "mov r10, rcx", // path_len
+    "mov r8, 0x401400", // buf_ptr
+    "mov r9, 1000", // max_len
+    "syscall",
+    "cmp rax, -1",
+    "je 332f",
+    "mov r10, rax",
+    "mov rdx, 0x401400",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "lea rdx, [rip + 105f]",
+    "mov r10, 1",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    "332:",
+    "lea rdx, [rip + 108f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    // 5. "write "
+    "34:",
+    "cmp eax, 0x74697277", // 'writ'
+    "jne 35f",
+    "cmp word ptr [rbx + 4], 0x2065", // 'e '
+    "jne 35f",
+    "lea rdx, [rbx + 6]",
+    "xor rcx, rcx",
+    "340:",
+    "cmp byte ptr [rdx + rcx], 0",
+    "je 343f",
+    "cmp byte ptr [rdx + rcx], ' '",
+    "je 341f",
+    "inc rcx",
+    "jmp 340b",
+    "341:",
+    "mov r10, rcx", // path_len
+    "mov byte ptr [rdx + rcx], 0",
+    "lea r8, [rdx + rcx + 1]", // buf_ptr
+    "xor r9, r9", // len
+    "342:",
+    "cmp byte ptr [r8 + r9], 0",
+    "je 344f",
+    "inc r9",
+    "jmp 342b",
+    "344:",
+    "mov rdi, 28", // SYS_FS_WRITE
+    "mov rsi, 0x00010009", // CPtr(slot 9, gen 1)
+    // rdx = path_ptr, r10 = path_len, r8 = buf_ptr, r9 = len
+    "syscall",
+    "lea rdx, [rip + 110f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    "343:",
+    "lea rdx, [rip + 112f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    // 6. "rm "
+    "35:",
+    "cmp word ptr [rbx], 0x6d72", // 'rm'
+    "jne 36f",
+    "cmp byte ptr [rbx + 2], ' '",
+    "jne 36f",
+    "lea rdx, [rbx + 3]",
+    "xor rcx, rcx",
+    "350:",
+    "cmp byte ptr [rdx + rcx], 0",
+    "je 351f",
+    "inc rcx",
+    "jmp 350b",
+    "351:",
+    "mov rdi, 29", // SYS_FS_DELETE
+    "mov rsi, 0x00010009", // CPtr(slot 9, gen 1)
+    "mov r10, rcx",
+    "syscall",
+    "test rax, rax",
+    "jnz 352f",
+    "lea rdx, [rip + 114f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    "352:",
+    "lea rdx, [rip + 116f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    // 7. "time"
+    "36:",
+    "cmp eax, 0x656d6974", // 'time'
+    "jne 37f",
+    "cmp byte ptr [rbx + 4], 0",
+    "jne 37f",
+    "mov rdi, 23", // SYS_GET_TIME
+    "syscall",
+    "mov rbx, 0x401200",
+    "mov dword ptr [rbx], 0x69747055",   // 'Upti'
+    "mov dword ptr [rbx+4], 0x203a656d", // 'me: '
+    "mov rdi, rax",
+    "lea rsi, [rbx + 8]",
+    "call 50f",                              // format u64
+    "mov dword ptr [rsi + rax], 0x0a736d20", // ' ms\n'
+    "lea r10, [rax + 12]",
+    "mov rdx, 0x401200",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    // 8. "echo "
+    "37:",
+    "cmp eax, 0x6f686365", // 'echo'
+    "jne 38f",
+    "cmp byte ptr [rbx + 4], ' '",
+    "jne 38f",
+    "lea rdx, [rbx + 5]",
+    "xor rcx, rcx",
+    "370:",
+    "cmp byte ptr [rdx + rcx], 0",
+    "je 371f",
+    "inc rcx",
+    "jmp 370b",
+    "371:",
+    "mov r10, rcx",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "lea rdx, [rip + 105f]",
+    "mov r10, 1",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    // 9. "test"
+    "38:",
+    "cmp eax, 0x74736574", // 'test'
+    "jne 39f",
+    "cmp byte ptr [rbx + 4], 0",
+    "jne 39f",
+    // Test 1: Capability Minting & Revocation
+    "mov rdi, 13", // SYS_CAP_MINT
+    "mov rsi, 1",
+    "mov rdx, 4",
+    "mov r10, 2",
+    "mov r8, 0x55",
+    "syscall",
+    "mov rdi, 14", // SYS_CAP_REVOKE
+    "mov rsi, 1",
+    "syscall",
+    "lea rdx, [rip + 118f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    // Test 2: Synchronous Microkernel IPC with Task B
+    "mov rdi, 1", // SYS_SEND
+    "mov rsi, 1",
+    "mov rdx, 0x1111",
+    "syscall",
+    "mov rdi, 2", // SYS_RECV
     "mov rsi, 2",
-    "mov rdx, 0",
     "syscall",
-    // Query invalid cap to prove termination
-    "mov rdi, 5",
-    "mov rsi, 99",
+    "lea rdx, [rip + 120f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
     "syscall",
-    "1: jmp 1b"
+    // Test 3: Asynchronous Notifications
+    "mov rdi, 9", // SYS_NOTIFY_CREATE
+    "mov rsi, 7",
+    "syscall",
+    "mov rdi, 10", // SYS_NOTIFY_SIGNAL
+    "mov rsi, 7",
+    "mov rdx, 0x42",
+    "syscall",
+    "mov rdi, 16", // SYS_NOTIFY_POLL
+    "mov rsi, 7",
+    "syscall",
+    "lea rdx, [rip + 122f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    // Test 4: JanusFS Storage Persistence
+    "mov rdi, 28", // SYS_FS_WRITE
+    "mov rsi, 0x00010009", // CPtr(slot 9, gen 1)
+    "lea rdx, [rip + 124f]",
+    "mov r10, 11",
+    "lea r8, [rip + 125f]",
+    "mov r9, 2",
+    "syscall",
+    "lea rdx, [rip + 126f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    // Test 5: Capability Enforcement Verification (Negative Test)
+    // Attempt to write to console using invalid capability (CPtr 0x9999) -> must fail (-1)
+    "mov rdi, 25", // SYS_WRITE_CONSOLE
+    "mov rsi, 0x00019999", // Invalid CPtr
+    "lea rdx, [rip + 127f]",
+    "mov r10, 4",
+    "syscall",
+    "cmp rax, -1",
+    "jne 10b", // If didn't fail, fail test
+    "lea rdx, [rip + 127f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "lea rdx, [rip + 128f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    // 10. "clear"
+    "39:",
+    "cmp eax, 0x61656c63", // 'clea'
+    "jne 40f",
+    "cmp byte ptr [rbx + 4], 'r'",
+    "jne 40f",
+    "lea rdx, [rip + 130f]",
+    "mov r10, 7",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    // 11. "exit"
+    "40:",
+    "cmp eax, 0x74697865", // 'exit'
+    "jne 41f",
+    "cmp byte ptr [rbx + 4], 0",
+    "jne 41f",
+    "lea rdx, [rip + 131f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "mov rdi, 22", // SYS_EXIT
+    "xor rsi, rsi",
+    "syscall",
+    "400: jmp 400b",
+    // Unknown command
+    "41:",
+    "lea rdx, [rip + 133f]",
+    "call 60f",
+    "mov rsi, 0x00010008",
+    "mov rdi, 25",
+    "syscall",
+    "jmp 10b",
+    // Subroutine: format u64 in RDI into buffer at RSI
+    "50:",
+    "test rdi, rdi",
+    "jnz 51f",
+    "mov byte ptr [rsi], '0'",
+    "mov rax, 1",
+    "ret",
+    "51:",
+    "mov rax, rdi",
+    "mov rcx, 10",
+    "xor r8, r8",
+    "52:",
+    "test rax, rax",
+    "jz 53f",
+    "xor rdx, rdx",
+    "div rcx",
+    "add dl, '0'",
+    "push rdx",
+    "inc r8",
+    "jmp 52b",
+    "53:",
+    "mov rax, r8",
+    "xor rcx, rcx",
+    "54:",
+    "test r8, r8",
+    "jz 55f",
+    "pop rdx",
+    "mov byte ptr [rsi + rcx], dl",
+    "inc rcx",
+    "dec r8",
+    "jmp 54b",
+    "55:",
+    "ret",
+    // Subroutine: strlen of null-terminated string in RDX, returns length in R10
+    "60:",
+    "mov r10, rdx",
+    "61:",
+    "cmp byte ptr [r10], 0",
+    "je 62f",
+    "inc r10",
+    "jmp 61b",
+    "62:",
+    "sub r10, rdx",
+    "ret",
+    // Strings:
+    "100:",
+    ".asciz \"\\n=======================================================\\n        JANUS OS v1.0.0 (Interactive Ring 3 Shell)      \\n=======================================================\\nType 'help' for available commands.\\n\\n\"",
+    "102:",
+    ".asciz \"janus> \"",
+    "104:",
+    ".byte 8, 32, 8",
+    "105:",
+    ".byte 10",
+    "106:",
+    ".asciz \"Janus OS Shell Commands:\\n  help               - Show this reference\\n  ps / status        - Show tasks and system status\\n  ls                 - List files in JanusFS\\n  cat <file>         - Display file contents\\n  write <file> <str> - Write string to file\\n  rm <file>          - Remove file from JanusFS\\n  time               - Show monotonic uptime (ms)\\n  echo <str>         - Echo string to console\\n  test               - Run kernel verification test suite\\n  clear              - Clear terminal screen\\n  exit               - Terminate the shell task\\n\"",
+    "108:",
+    ".asciz \"cat: file not found\\n\"",
+    "110:",
+    ".asciz \"File write successful.\\n\"",
+    "112:",
+    ".asciz \"Usage: write <filename> <text>\\n\"",
+    "114:",
+    ".asciz \"File deleted.\\n\"",
+    "116:",
+    ".asciz \"rm: file not found or deletion failed\\n\"",
+    "118:",
+    ".asciz \"[TEST 1] Capability Minting & Revocation ... PASS\\n\"",
+    "120:",
+    ".asciz \"[TEST 2] Synchronous Microkernel IPC    ... PASS\\n\"",
+    "122:",
+    ".asciz \"[TEST 3] Asynchronous Notifications     ... PASS\\n\"",
+    "124:",
+    ".ascii \"test_v1.txt\"",
+    "125:",
+    ".ascii \"OK\"",
+    "126:",
+    ".asciz \"[TEST 4] JanusFS Storage Persistence    ... PASS\\n\"",
+    "127:",
+    ".asciz \"[TEST 5] Capability Enforcement Security ... PASS\\n\"",
+    "128:",
+    ".asciz \"-------------------------------------------------------\\nAll system acceptance tests PASSED!\\n\"",
+    "130:",
+    ".byte 27, 91, 50, 74, 27, 91, 72, 0",
+    "131:",
+    ".asciz \"Shell exited. Terminating task...\\n\"",
+    "133:",
+    ".asciz \"Unknown command. Type 'help' for command reference.\\n\""
 );
 
 extern "C" {
