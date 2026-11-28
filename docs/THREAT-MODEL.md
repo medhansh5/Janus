@@ -1,67 +1,57 @@
 # Janus Threat Model
 
-This document outlines the threat model for the Janus operating system. It defines the attackers we defend against, the specific threats we mitigate, and explicitly states what is out of scope for the v1 release.
+This document outlines the threat model for Janus OS as of **V1.1.1**, distinguishing **implemented mitigations** from **planned mitigations** and **out-of-scope risks**.
 
-## 1. What Janus Defends Against
+## 1. Threat Categories & Current Mitigations
 
-The core philosophy of Janus is that **compromise is inevitable, but lateral movement should be impossible.**
+The core design goal of Janus is to minimize lateral movement by enforcing capability-based isolation between Ring 3 tasks and Ring 0 kernel state.
 
-### 1.1 Malicious Userspace Applications
-- **Threat**: An application intentionally attempts to access arbitrary files, sniff network traffic, or escalate privileges.
-- **Defense**: Applications run in a WebAssembly sandbox (and native services are capability-isolated). Applications have zero ambient authority. They can only access resources they have explicitly been granted via `CPtr` handles.
-- **Mitigation**: A malicious app cannot read `/etc/shadow` because there is no `/etc/shadow` in its namespace, nor does it possess a capability to ask the VFS for it.
+### 1.1 Unprivileged Userspace Tasks
+- **Threat**: A Ring 3 task attempts to read/write kernel memory, access another task's memory, or use console/storage services without authorization.
+- **Implemented Mitigation**:
+  - Per-task isolated PML4 page tables; `copy_from_user` / `copy_to_user` pre-validate null pointers, kernel-half bounds, canonicality, page presence, and `USER_ACCESSIBLE` flags.
+  - Syscalls 24–30 (`SYS_READ_CONSOLE`..`SYS_FS_LIST`) validate `CapType::Console` / `CapType::Storage`, generation-tagged `CPtr`s, and `READ`/`WRITE` rights before accessing user buffers or performing I/O.
+  - Invalid/revoked capability handles return `-1` (`!0`).
+- **Planned Mitigation**: Sandboxed WASM AOT application execution and isolated Ring 3 VFS/driver processes (not yet implemented in V1.1.1).
 
-### 1.2 Compromised Drivers and Services
-- **Threat**: A vulnerability in a complex parser (e.g., the TCP/IP stack) or a hardware driver (e.g., NVMe driver) is exploited by a remote attacker.
-- **Defense**: The microkernel architecture ensures that drivers and network stacks run as unprivileged userspace processes. 
-- **Mitigation**: If the network stack is compromised via a malformed packet, the attacker gains code execution *only* within the isolated network service. They cannot write to the disk or alter memory belonging to other processes, because the network service does not hold capabilities for those resources.
+### 1.2 Memory Corruption & Code Execution
+- **Threat**: Buffer overflows, Use-After-Free (UAF), or code injection in kernel or userspace.
+- **Implemented Mitigation**:
+  - Written primarily in Rust, which prevents spatial/temporal memory bugs in safe code; however, kernel internals, DMA rings, and assembly entry points rely on `unsafe` blocks that must be audited manually.
+  - Strict W^X (`RX` / `R` / `RW`, non-executable `GNU_STACK`) enforced on kernel ELF segments and user `Frame` / `MmioFrame` capability mappings.
+- **Not Implemented (Planned)**: Kernel or userspace **ASLR** is **not implemented** in V1.1.1; kernel virtual base (`0xffffffff80000000`) and user task addresses (`0x400000`+) are static.
 
-### 1.3 Memory Corruption Attacks
-- **Threat**: Attackers utilize buffer overflows, Use-After-Free (UAF), or ROP chains to execute arbitrary code.
-- **Defense**: 
-  1. The kernel and core services are written in Rust, eliminating spatial and temporal memory safety bugs by default (except in heavily audited `unsafe` blocks).
-  2. Strict W^X (Write XOR Execute) memory page permissions prevent the execution of injected shellcode.
-  3. ASLR prevents the reliable chaining of ROP gadgets.
+### 1.3 Unauthorized Kernel Modification (Verified Boot)
+- **Threat**: Modifying `kernel.elf` on the EFI System Partition before boot.
+- **Current Status (Placeholder)**: `bootloader/src/main.rs` currently logs `[MOCK PASS]` for kernel signature verification. **Cryptographic verified boot is not implemented in V1.1.1**; tampering with `kernel.elf` on disk is not detected at boot.
 
-### 1.4 Unauthorized Kernel Modification
-- **Threat**: An attacker attempts to modify the kernel on disk to establish a persistent rootkit.
-- **Defense**: Verified Boot. The bootloader cryptographically verifies the signature of the kernel before handoff. An unauthorized kernel will simply refuse to boot.
+### 1.4 Device & Interrupt Isolation
+- **Threat**: Unauthorized port I/O or interrupt spoofing/storms.
+- **Implemented Mitigation**:
+  - `CapType::IOPort` validates port base, range, and access width (`1`/`2`/`4` bytes) for `sys_in_port`/`sys_out_port`.
+  - Hardware IRQs mask the firing PIC line in `idt.rs` (single EOI) and require `CapType::Irq` + `CapRights::WRITE` in `sys_irq_ack` to unmask; orphaned IRQ lines are unbound/unmasked on last-owner CSpace destruction.
+- **Current Limitation**: In V1.1.1, the active legacy VirtIO-Blk driver and JanusFS run inside Ring 0 (kernel TCB) rather than as untrusted Ring 3 processes.
 
 ---
 
-## 2. Explicitly Out of Scope for v0 / v1
+## 2. Explicitly Out of Scope / Accepted Risks for V1.1.1
 
-The following threats are acknowledged but deferred to later iterations of Janus:
+1. **Side-Channel Attacks (Spectre, Meltdown, Cache Timing)**: Not mitigated.
+2. **Physical Access & Evil Maid Attacks**: No Full Disk Encryption (FDE), no TPM measured boot, and mock bootloader signature check.
+3. **Local Denial of Service (DoS) & Resource Starvation**: No CPU time quotas or IPC rate limits. Synchronous VirtIO-Blk polling uses a bounded `2_000_000`-spin timeout to avoid infinite hangs, but blocks the kernel during I/O.
+4. **Power-Loss Crash Consistency**: JanusFS has no journaling or copy-on-write; power loss mid-flush across sectors is not crash-atomic.
+5. **Uniprocessor & Syscall Scratch Assumptions**: Single-core x86_64 only. `syscall_entry` uses global `USER_RSP_SCRATCH`/`KERNEL_RSP_SCRATCH` with `SFMask` (`IF=0`), which is unsafe for SMP and not reentrant under NMI/faults in the entry window.
+6. **Residual Ambient / Diagnostic Syscalls (Design Limitations, Not Kernel-Memory Exposure)**: Syscalls `8`, `19`, `23`, and `32` do not require capability handles in V1.1.1. None of them allow reading or writing kernel memory, as user pointers are validated via `copy_from_user`/`copy_to_user`:
+   - **`SYS_LOG` (8)**: Reads a `u32` from user memory via `copy_user_u32` (validated for null, kernel-half, canonicality, presence, and `USER_ACCESSIBLE`) and writes a hex diagnostic line to COM1 (`0x3F8`) **without** requiring `CapType::Console` (`WRITE`). This is an intentional diagnostic limitation that bypasses console capability isolation for serial output.
+   - **`SYS_SLEEP` (19)**: Validates `current_task_mut()` and blocks the calling task until `current_tick + duration_ms` (or yields via `schedule()` when `duration_ms == 0`). It affects only the caller's own scheduling state and cannot block or modify another task; local CPU/scheduling DoS remains out of scope (§2.3).
+   - **`SYS_GET_TIME` (23)**: Returns the global monotonic 1 ms PIT tick count (`idt::get_tick_count()`). It is read-only and exposes no kernel addresses, though it provides a coarse 1 ms timing source to any caller (timing side-channels are out of scope per §2.1).
+   - **`SYS_TASK_STATUS` (32)**: Formats system uptime and every active/terminated task's PID and `TaskState` (`0..MAX_TASKS`) into a user buffer validated via `copy_user_slice_to`. While it does not expose kernel memory addresses or mutate other tasks, it discloses cross-task existence and scheduling/blocking states to unprivileged callers without a capability.
 
-### 2.1 Side-Channel Attacks (e.g., Spectre, Meltdown)
-- While Janus isolates memory, preventing advanced microarchitectural side-channel attacks is extremely difficult and out of scope for the initial versions. We do not guarantee protection against an application inferring data from another via cache timing.
+---
 
-### 2.2 Physical Access & Evil Maid Attacks
-- If an attacker has physical access to the machine, they can modify the UEFI firmware or extract data directly from the unencrypted disk. Full Disk Encryption (FDE) and TPM-backed measured boot are deferred to v2.
+## 3. Component Trust Levels (V1.1.1)
 
-### 2.3 Denial of Service (DoS) and Resource Starvation
-- As the kernel introduces a preemptive scheduler, resource-starvation attacks (e.g., a malicious task intentionally exhausting its timeslice or flooding IPC channels) become possible. Fine-grained resource quotas, CPU time accounting, and real-time scheduling guarantees are not implemented in v1. Until these defenses are built, local DoS remains an accepted risk.
-
-### 2.4 Multi-Core Support and APIC Migration (Deferred to v1+)
-- For the v0 milestone, the kernel targets a uniprocessor environment and uses the legacy 8259 PIC for timer interrupts. The PIC is insufficient for multi-core scaling (as it lacks Inter-Processor Interrupt (IPI) support). Multi-core support is deferred to v1+, which will require migrating the interrupt subsystem to the Advanced Programmable Interrupt Controller (APIC) and implementing concurrent capability management.
-
-### 2.5 Interpreter vs. AOT Tradeoff (v0 Accepted Risk)
-
-> [!WARNING]
-> **Accepted Risk for v0:** In the v0 milestone, Janus relies on `wasmi` (a WebAssembly interpreter) to execute applications.
-> 
-> Running an interpreter over untrusted code inside a privileged runtime environment inherently increases the attack surface compared to Ahead-Of-Time (AOT) compiled native code. A bug in the interpreter could allow an application to break out of the WASM sandbox and execute native code with the privileges of the WASM host process.
-> 
-> **Resolution Plan:** This is an accepted risk strictly for v0 to prove the end-to-end OS pipeline. Before any untrusted third-party application is loaded outside of a dev/test environment (v1+), the architecture will transition to AOT compilation (validating and compiling WASM to native ELF at install time).
-
-### 2.5 Audit & Provenance (Deferred to v1 GA)
-- Capability grant/revoke logging is deferred. While not present in v0, this is acknowledged as a hard requirement for forensic analysis and system auditing, and will be designed and implemented before v1 GA.
-
-## 3. Component Trust Levels
-
-1. **Kernel (TCB)**: Highly Trusted. Responsible only for IPC routing, context switching, capability validation, and memory isolation.
-2. **Init Task**: Highly Trusted. The first userspace task is responsible for allocating initial capabilities (parsing `INIT-POLICY.md`) and spawning service tasks.
-3. **Drivers (e.g., virtio-blk)**: Untrusted. Hardware drivers run entirely in Ring 3 userspace. They cannot arbitrarily access PCI space or system memory. The kernel discovers PCI devices and mints strictly scoped `IOPort` (for the device's BARs), `Frame` (for DMA), and `InterruptEndpoint` capabilities to the driver. If a driver crashes or goes rogue, it can only affect its assigned device and clients; it cannot breach kernel memory or other devices.
-4. **WASM Runtime / Web Applications**: Untrusted. Will run sandboxed within isolated userspace tasks.
-5. **System Services**: Moderately Trusted. VFS or Network stack run as isolated tasks and must be robust against malicious inputs from unprivileged tasks, but their internal compromise doesn't necessarily breach the kernel.
-6. **Supply-Chain Risk**: We acknowledge the dependency supply-chain risk introduced by third-party packages (crates.io). To mitigate this, Janus commits to using minimal dependencies in kernel/service code, utilizing pinned lockfiles, and running periodic `cargo-audit` checks.
+1. **UEFI Bootloader (`bootloader`)**: Trusted Boot Stub (mock signature check).
+2. **Microkernel (`kernel`, Ring 0)**: Highly Trusted TCB — includes scheduler, paging, `CNode`/CDT, IPC, notifications, PIC/IDT, COM1/PS2 console, legacy VirtIO-Blk polling driver, and JanusFS.
+3. **Userspace Tasks (`Task A`, `Task B`, Ring 3)**: Untrusted/isolated — `Task A` holds `Console`, `Storage`, `Endpoint`, `Frame`, and `Irq` capabilities; `Task B` holds only `Endpoint`, `Frame`, `IOPort`, and `Irq` capabilities (no `Console` or `Storage`).
+4. **Supply-Chain Risk**: Minimal `no_std` crate set (`bitflags`, `x86_64`, `spin`, `volatile`, `uefi`, `xmas-elf`) pinned via `Cargo.lock`.

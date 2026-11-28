@@ -1,5 +1,7 @@
 # Task List: Virtio-Blk Driver
 
+> **Historical Document Notice:** This checklist records early v0/v1 prototype planning for a userspace VirtIO-Blk driver (`InterruptEndpoint` / `SYS_LOG` Sector 0 proof). It does **not** reflect the current V1.1.1 implementation, where legacy VirtIO-Blk and JanusFS run in Ring 0 and IRQs use `CapType::Irq` + `Notification`. For current documentation, see [README.md](../README.md), [ARCHITECTURE.md](ARCHITECTURE.md), [LIMITATIONS.md](LIMITATIONS.md), and [V1_1_1_RELEASE_READINESS.md](architecture/V1_1_1_RELEASE_READINESS.md).
+
 ## Foundation
 - `[x]` **Design Virtio Capabilities**: Map the required capabilities (IOPort, Frame, InterruptEndpoint) to isolate driver access.
 - `[x]` **Capability Provisioning**: Kernel explicitly hands scoped capabilities (like specific IOPort ranges for PCI) to the untrusted driver process.

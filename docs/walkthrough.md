@@ -1,5 +1,7 @@
 # Walkthrough: Phase 3 - Preemptive Scheduler & IDT
 
+> **Historical Document Notice:** This walkthrough records the early v0/v1 Phase 3 milestone (when `InterruptEndpoint` was used and delegation/unmapping were not yet implemented). For the current V1.1.1 system, see [README.md](../README.md), [ARCHITECTURE.md](ARCHITECTURE.md), [LIMITATIONS.md](LIMITATIONS.md), and [V1_1_1_RELEASE_READINESS.md](architecture/V1_1_1_RELEASE_READINESS.md).
+
 Phase 3 introduces hardware interrupts, an IDT (Interrupt Descriptor Table), the legacy 8259 PIC (Programmable Interrupt Controller), and a preemptive scheduler to Janus v0.
 
 ## 1. Unifying Context Switch to `iretq`

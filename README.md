@@ -1,41 +1,41 @@
 # Janus OS
 
-[![CI-badge](https://github.com/ashcresthq/janus/actions/workflows/ci.yml/badge.svg)](https://github.com/ashcresthq/janus/actions/workflows/ci.yml)
+[![CI-badge](https://github.com/medhansh5/Janus/actions/workflows/ci.yml/badge.svg)](https://github.com/medhansh5/Janus/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT_or_Apache--2.0-blue.svg)](LICENSE)
 
-**Janus** is a security-first microkernel operating system written in Rust, built around kernel-enforced capabilities and zero ambient authority. All resource access requires explicit, unforgeable capability handles managed strictly by the microkernel.
+**Janus** is an experimental, security-focused x86_64 microkernel operating system written in Rust, built around kernel-managed object capabilities (`CPtr` handles), W^X page isolation, and Ring 3 execution.
 
-> **GitHub Topics**: `rust` • `osdev` • `operating-system` • `microkernel` • `kernel` • `systems-programming` • `security` • `x86-64`
+> **Scope Notice:** Janus V1.1.1 is an early-stage research/systems-engineering microkernel targeting **uniprocessor QEMU x86_64** with OVMF UEFI firmware. It is **not** production-ready, **not** POSIX-compatible, and does **not** claim general-purpose bare-metal hardware compatibility.
 
 ---
 
-## Architecture Diagram
+## Architecture Overview
 
 ```text
 +-----------------------------------------------------------------------+
 |                             USERSPACE (Ring 3)                         |
 |                                                                       |
-|  +--------------------+   +-------------------+   +----------------+  |
-|  | WASM Application   |   | Virtio-Blk Driver |   |   Init Task    |  |
-|  | (Sandboxed App)    |   | (Storage Service) |   | (Cap Root/Boot)|  |
-|  +---------+----------+   +---------+---------+   +-------+--------+  |
-|            |                        |                     |           |
-|            | CPtr Handle            | CPtr / IOPort       | Manifest  |
-|            v                        v                     v           |
+|  +----------------------------------+   +--------------------------+  |
+|  | Task A: Interactive Shell        |   | Task B: IPC Responder    |  |
+|  | (`help`, `ls`, `cat`, `write`,   |   | (Synchronous rendezvous  |  |
+|  |  `rm`, `ps`, `time`, `test`, ...) |   |  IPC via Endpoint caps)  |  |
+|  +----------------+-----------------+   +------------+-------------+  |
+|                   |                                  |                |
+|                   | `syscall` / `iretq` (CPtr in `rsi`)                |
+|                   v                                  v                |
 |=======================================================================|
 |                   SYSTEM CALL & CAPABILITY BOUNDARY                   |
-|                        `syscall` / `sysret` ABI                        |
 |=======================================================================|
 |                             MICROKERNEL (Ring 0)                      |
 |                                                                       |
 |  +------------------+  +-------------------+  +--------------------+  |
-|  | CSpace & Cap     |  | Preemptive        |  |  Physical Frame    |  |
-|  | Table Validation |  | Scheduler & IPC   |  |  & Page Table Alloc|  |
+|  | CSpace & CDT     |  | Preemptive IRQ0   |  | Physical Frame &   |  |
+|  | Validation       |  | Scheduler & IPC   |  | Higher-Half Paging |  |
 |  +------------------+  +-------------------+  +--------------------+  |
-|                                                                       |
-|  +-----------------------------------------------------------------+  |
-|  | Hardware IRQ Routing & InterruptEndpoint Dispatch (IRQ0 Timer)  |  |
-|  +-----------------------------------------------------------------+  |
+|  +------------------+  +-------------------+  +--------------------+  |
+|  | Console (COM1 /  |  | JanusFS & Legacy  |  | 8259 PIC & Async   |  |
+|  | PS/2) Service    |  | VirtIO-Blk Driver |  | Notification Pool  |  |
+|  +------------------+  +-------------------+  +--------------------+  |
 +-----------------------------------------------------------------------+
 ```
 
@@ -44,149 +44,73 @@
 ## Feature Maturity Classification
 
 ### Implemented & Validated Functionality (v1.1.1)
-- **Capability-Gated System Services**: Console I/O (syscalls 24–25) and JanusFS storage (syscalls 26–30) require explicit `CapType::Console` / `CapType::Storage` capabilities with `READ`/`WRITE` rights.
-- **Persistent JanusFS on Legacy VirtIO-Blk**: Kernel legacy VirtIO 0.9.5 block driver (`0x1AF4:0x1001`, I/O BAR0, 256-entry VirtQueue, synchronous polling with bounded timeout) backing JanusFS sector persistence across reboots with transactional allocation rollback on disk-full or I/O errors.
-- **Hardware IRQ Routing & Single-EOI Protocol**: Dual 8259 PIC vectors 32–47 with spurious IRQ7/IRQ15 handling, IDT masking + single EOI, `CapType::Irq` + `CapRights::WRITE` acknowledgement, asynchronous `Notification` delivery, and automatic IRQ unbind/unmask cleanup on last-owner destruction.
-- **Contiguous DMA & W^X Memory Safety**: Higher-half paging, isolated user PML4s, and `copy_from_user`/`copy_to_user` pre-validation.
-- **Preemptive IRQ0 Scheduler & Ring 3 Interactive Shell**: 1000 Hz PIT timer scheduler, Ring 3 shell (`help`, `ps`, `ls`, `cat`, `write`, `rm`, `time`, `echo`, `test`, `clear`, `exit`).
+- **UEFI Bootloader & Higher-Half x86_64 Kernel**: Custom `x86_64-unknown-uefi` loader maps ELF segments with W^X permissions (`RX` / `R` / `RW`) and jumps to the higher-half kernel. *(Note: kernel signature verification in the bootloader is currently a mock check.)*
+- **Virtual Memory & Ring 3 Isolation**: Bitmap physical frame allocator, direct physical map (`0xFFFF_8000_...`), isolated user PML4s, and pre-validated `copy_from_user` / `copy_to_user`.
+- **Capability-Based Access Control**: 128-slot per-task `CNode`s, Capability Derivation Tree (CDT) with iterative revocation, generation-tagged `CPtr` handles, and rights attenuation across `Untyped`, `Endpoint`, `Notification`, `CNode`, `Frame`, `MmioFrame`, `IOPort`, `Irq`, `Console`, and `Storage`.
+- **Capability-Gated System Services**: Console I/O (syscalls 24–25) and JanusFS storage (syscalls 26–30) require explicit `CapType::Console` / `CapType::Storage` capabilities with `READ` / `WRITE` rights. *(Diagnostic syscalls such as `SYS_GET_TIME=23` and `SYS_TASK_STATUS=32` remain un-gated.)*
+- **Synchronous IPC & Asynchronous Notifications**: Blocking rendezvous IPC (`SYS_SEND`/`SYS_RECV`) and 64-object coalescing event bitmask `Notification`s (`SYS_NOTIFY_CREATE`/`SIGNAL`/`WAIT`/`POLL`).
+- **Hardware Interrupts & PIT Timekeeping**: Dual 8259 PIC (vectors 32–47), 1000 Hz PIT timer preemption, spurious IRQ7/IRQ15 filtering, single-EOI masking/unmasking (`CapType::Irq` + `CapRights::WRITE`), and automatic IRQ unbind/unmask cleanup on last-owner destruction.
+- **Persistent JanusFS on Legacy VirtIO-Blk**: Kernel legacy VirtIO 0.9.5 PCI driver (`0x1AF4:0x1001`, I/O BAR0, 256-entry VirtQueue, synchronous polling with bounded spin timeout) backing JanusFS sector persistence across QEMU reboots, with transactional allocation rollback on disk-full or synchronous write errors.
+- **Interactive Ring 3 Shell**: `help`, `ps`/`status`, `ls`, `cat`, `write`, `rm`, `time`, `echo`, `test`, `clear`, and `exit`.
 
-### Planned Functionality
-- **WASM Application Runtime**: Sandboxed Ahead-Of-Time (AOT) WebAssembly application execution.
+### Planned / Future Work
+- **Multi-Core Support (SMP)**: x2APIC migration, IPIs, and per-CPU `swapgs` syscall stacks.
 - **Asynchronous IRQ-Driven Block I/O & Modern VirtIO / NVMe**.
-- **Crash-Consistent Journaling / CoW Filesystem**.
-- **Multi-Core Support (SMP)**: x2APIC migration, per-CPU `swapgs` stacks, IPIs, and multi-core scheduling.
+- **Crash-Consistent Journaling / Copy-on-Write Filesystem**.
+- **Userspace Driver Isolation & WASM Application Runtime**.
 
 ---
 
-## Supported Hardware & Target Specifications
+## Target Specifications & Tested Environment
 
-### Target Triples
-- **Kernel Target**: `x86_64-unknown-none`
-- **Bootloader Target**: `x86_64-unknown-uefi`
-
-### Supported Hardware & VM Platforms
-- **Primary Emulator**: QEMU x86_64 (`qemu-system-x86_64`) with OVMF UEFI firmware, Virtio-Blk disk controller (`-drive file=...,if=virtio`), and 8254 PIT / APIC timer interrupts.
-- **Bare-Metal Hardware**: 64-bit x86_64 CPUs with UEFI firmware support and PCI bus controllers.
-
-### Unsupported Targets (Out of Scope for v1)
-- 32-bit x86 architecture.
-- Legacy BIOS / CSM boot modes.
-- ARM64 / AArch64 and RISC-V architectures (planned for future major releases).
+- **Kernel Target:** `x86_64-unknown-none`
+- **Bootloader Target:** `x86_64-unknown-uefi`
+- **Verified Emulator Platform:** QEMU x86_64 (`qemu-system-x86_64`) with OVMF UEFI firmware, legacy VirtIO-Blk (`-drive file=...,format=raw,if=virtio`), COM1 serial, PS/2 keyboard, and 8254 PIT / 8259 PIC.
+- **Unsupported:** 32-bit x86, Legacy BIOS/CSM, ARM64/RISC-V, SMP, and unverified general-purpose bare-metal hardware.
 
 ---
 
-## Clean-Machine Build & Boot Instructions
+## Build, Test & QEMU Execution
 
-Follow these instructions to install dependencies, build the kernel, and launch Janus in QEMU from a fresh operating system installation.
+### Prerequisites
+- Rust `nightly` toolchain with `rust-src`, `llvm-tools-preview`, `rustfmt`, `clippy`, and targets `x86_64-unknown-none` and `x86_64-unknown-uefi`.
+- `qemu-system-x86_64` and OVMF UEFI firmware (`OVMF.fd` / `edk2-x86_64-code.fd`).
 
-### 1. Install Prerequisites
-
-#### Ubuntu / Debian
+### Build & Quality Gates
 ```bash
-sudo apt update
-sudo apt install -y build-essential git qemu-system-x86 ovmf
+# Formatting, unit tests (122 tests), and Clippy
+cargo +nightly fmt --all -- --check
+cargo +nightly test -p kernel --lib
+cargo +nightly clippy -p kernel --lib --tests -- -D warnings
+
+# Release builds
+cargo +nightly build -p kernel --target x86_64-unknown-none --release "-Zbuild-std=core,compiler_builtins"
+cargo +nightly build -p bootloader --target x86_64-unknown-uefi --release "-Zbuild-std=core,alloc,compiler_builtins"
 ```
 
-#### Fedora
+### Running in QEMU
+Stage `esp/EFI/BOOT/BOOTX64.EFI` (from `bootloader.efi`) and `esp/kernel.elf` (from `kernel`), create a raw disk image `disk.img` (1 MiB zeroed), and launch QEMU:
 ```bash
-sudo dnf install -y make git qemu-system-x86 edk2-ovmf
+qemu-system-x86_64 \
+  -drive if=pflash,format=raw,readonly=on,file=/path/to/OVMF_CODE.fd \
+  -drive format=raw,file=fat:rw:esp \
+  -drive file=disk.img,format=raw,if=virtio \
+  -serial stdio \
+  -display none \
+  -no-reboot
 ```
-
-#### Arch Linux
-```bash
-sudo pacman -S --needed base-devel git qemu-system-x86_64 edk2-ovmf
-```
-
-#### macOS (Homebrew)
-```bash
-brew install make git qemu
-```
-
-### 2. Install Rust Nightly Toolchain
-
-```bash
-# Install rustup if not present
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source $HOME/.cargo/env
-
-# Add nightly targets and components
-rustup toolchain install nightly
-rustup target add x86_64-unknown-none x86_64-unknown-uefi --toolchain nightly
-rustup component add rust-src llvm-tools-preview rustfmt clippy --toolchain nightly
-```
-
-### 3. Clone and Build
-
-```bash
-git clone https://github.com/ashcresthq/janus.git
-cd janus
-
-# Build bootloader and kernel binaries
-make all
-```
-
-### 4. Run in QEMU
-
-```bash
-# On Ubuntu/Debian (default OVMF path: /usr/share/ovmf/OVMF.fd)
-make run
-
-# On Fedora / Arch / macOS (override OVMF path as needed):
-make run OVMF=/usr/share/edk2/x64/OVMF.fd
-```
-
----
-
-## Kernel / Userspace Boundary
-
-Janus relies on x86_64 hardware system call instructions (`syscall` / `sysret`) to separate Ring 0 microkernel space from Ring 3 userspace tasks.
-
-- **System Call ABI**: Userspace passes system call IDs in `rax`, capability handles (`CPtr`) in `rdi`, and payload registers in `rsi`, `rdx`, `r10`, and `r8`.
-- **Memory Boundary**: Kernel memory structures cannot be accessed by Ring 3 tasks. Virtual memory mappings are managed via isolated page tables per process.
-- **Capability Lookup**: Every syscall validates that the caller holds a valid `CPtr` in its `CSpace` table.
-
----
-
-## Security Model
-
-- **Zero Ambient Authority**: Processes possess no implicit permissions based on process ID or user credentials.
-- **Kernel-Managed Capabilities**: Capabilities exist only inside kernel memory. Userspace holds opaque `CPtr` handles.
-- **W^X Enforcement**: Pages are configured strictly as Writable (W) or Executable (X), but never both.
-- **I/O & Interrupt Isolation**: Hardware drivers execute in Ring 3 with port I/O restricted to assigned PCI BAR ranges and IRQs delivered over `InterruptEndpoint` handles.
-
-For complete details, see [SECURITY.md](SECURITY.md) and [THREAT-MODEL.md](docs/THREAT-MODEL.md).
+*(A `Makefile` is also provided for Linux debug builds via `make all` / `make run OVMF=...`; note that `make run` recreates `test.img` on each invocation.)*
 
 ---
 
 ## Known Limitations
 
-- **Single Core (Uniprocessor)**: The v1 release targets uniprocessor x86_64 execution. Multi-core SMP support is deferred to v4.
-- **Raw System Call ABI**: Higher-level Rust standard library support (`std`) is not available in Ring 3 tasks. Driver tests invoke syscalls via `no_std` assembly.
-- **Firmware Path**: Default `Makefile` uses `/usr/share/ovmf/OVMF.fd`. Non-Debian platforms require passing `OVMF=/path/to/OVMF.fd`.
+- **Uniprocessor Only (No SMP):** Single-core x86_64 only; `syscall_entry` uses global `USER_RSP_SCRATCH` / `KERNEL_RSP_SCRATCH` with `SFMask` clearing `IF=0` (not SMP-safe and not NMI-reentrant).
+- **Legacy VirtIO-Blk & Synchronous Polling:** Requires legacy VirtIO 0.9.5 PCI (`0x1AF4:0x1001`) with I/O `BAR0` and queue size `<= 256`; I/O uses bounded synchronous polling rather than async IRQ11 completion.
+- **JanusFS Limits & Crash Consistency:** Fixed 512-byte sectors (`64` cached blocks, `64` inodes, `2560` B max file size, 16-byte filenames). Persists across clean QEMU reboots with transactional rollback on disk-full or write errors, but has **no journaling or copy-on-write** for power-loss atomicity.
+- **No `std` in Userspace:** Ring 3 tasks use `no_std` assembly `syscall` wrappers (`rdi`=syscall number, `rsi`=arg1/`CPtr`, `rdx`=arg2, `r10`=arg3, `r8`=arg4, `r9`=arg5, returning via `iretq`).
 
-For full details, see [LIMITATIONS.md](docs/LIMITATIONS.md).
-
----
-
-## Repository Governance & Branch Strategy
-
-- **`main` Branch**: Production-ready, stable development branch. All PRs must pass automated CI checks (`.github/workflows/ci.yml`).
-- **Feature Branches**: `feature/<name>` for new features, `fix/<issue-number>` for fixes, `docs/<topic>` for documentation.
-- **Releases & Tags**: Milestone releases are tagged with semantic versioning (e.g., `v1.0.0`, `v0.1.0`). See [RELEASES.md](docs/RELEASES.md).
-
----
-
-## Documentation Index
-
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - System architecture, system call ABI, and memory model.
-- [THREAT-MODEL.md](docs/THREAT-MODEL.md) - Threat analysis, attack surface, and security boundaries.
-- [INIT-POLICY.md](docs/INIT-POLICY.md) - Init process capability grant design.
-- [ROADMAP.md](docs/ROADMAP.md) - Development roadmap and milestone timeline.
-- [LIMITATIONS.md](docs/LIMITATIONS.md) - Technical constraints and non-goals.
-- [RELEASES.md](docs/RELEASES.md) - Versioning, tagging, and branch strategy.
-- [CONTRIBUTING.md](CONTRIBUTING.md) - Code style, testing, and PR submission rules.
-- [SECURITY.md](SECURITY.md) - Security guarantees and vulnerability reporting policy.
-- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) - Community guidelines.
+For complete details, see [docs/LIMITATIONS.md](docs/LIMITATIONS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/architecture/V1_1_1_HARDENING_REPORT.md](docs/architecture/V1_1_1_HARDENING_REPORT.md).
 
 ---
 

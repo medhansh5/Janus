@@ -24,3 +24,7 @@ This document lists explicit technical limitations, constraints, and non-goals i
 ### 5. Driver Fault Recovery
 - **Constraint**: If a Ring 3 userspace driver process triggers an unhandled memory fault or exits, the kernel isolates the task, cleans its `CSpace`, and unmasks/unbinds any exclusively owned IRQ lines.
 - **Impact**: Automatic driver restartability is not yet implemented.
+
+### 6. Residual Diagnostic / Ambient Syscalls
+- **Constraint**: Syscalls `SYS_LOG` (8), `SYS_SLEEP` (19), `SYS_GET_TIME` (23), and `SYS_TASK_STATUS` (32) do not require capability handles in V1.1.1 (though user pointers passed to `SYS_LOG` and `SYS_TASK_STATUS` are validated via `copy_from_user`/`copy_to_user`).
+- **Impact**: `SYS_LOG` can write hex output to COM1 without `CapType::Console`, `SYS_GET_TIME` exposes a global 1 ms tick counter, and `SYS_TASK_STATUS` discloses cross-task PIDs and `TaskState`s to any Ring 3 caller. None expose kernel memory.

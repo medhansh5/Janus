@@ -1,5 +1,13 @@
 # Init Capability-Grant Policy Design
 
+> **Implementation Status (V1.1.1): PROPOSED / PLANNED (Not Yet Implemented)**
+>
+> The Static Manifest design below is **not** implemented in V1.1.1. Currently, `kernel/src/main.rs` (`kernel_main`) directly provisions bootstrap capabilities via hardcoded helpers in `kernel/src/capability.rs`:
+> - `init_task_a_bootstrap_cnode` (plus IRQ slot 6 in `main.rs`) grants Task A `Endpoint`, `Frame`, `Irq`, `Console` (slot 8), and `Storage` (slot 9).
+> - `init_task_b_bootstrap_cnode` grants Task B `Endpoint`, `Frame`, `IOPort`, and `Irq` (no `Console` or `Storage`).
+>
+> The remainder of this document preserves the original design rationale for a future manifest-driven `init` task.
+
 ## Overview
 In Janus, `init` is the first userspace process spawned by the microkernel. It is Highly Trusted and receives the "root" capabilities for all physical memory, hardware IO, and IRQs. The primary responsibility of `init` is to divide these root capabilities, derive lesser privileges from them, and spawn the core system services (VFS, drivers, WASM runtime) with exactly the capabilities they need.
 

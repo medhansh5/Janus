@@ -1,50 +1,54 @@
 # Janus OS Development Roadmap
 
-This document outlines completed milestones and future engineering phases for Janus OS.
+This document tracks implemented milestones and planned future engineering phases for Janus OS.
 
 ## Milestone Status Overview
 
 ```text
-[v1.0 Complete]  ──>  [v2.0 Near-Term]  ──>  [v3.0 Medium-Term]  ──>  [v4.0 Long-Term]
-Microkernel Core      Cap Trees & Fault     WASM Execution &      SMP & Multi-Arch
-Virtio-Blk Driver     Driver Recovery       VFS Storage Service   x2APIC / ARM64
+[v0.1.0 / v1.0.0] ──> [v1.1 / v1.1.1 Complete] ──> [v2.x Planned] ──> [v3.x+ Deferred]
+Core & IPC            Notifications, Ring 3 Shell,   Userspace Drivers  WASM AOT, SMP/x2APIC,
+                      Persistent JanusFS, Hardening  & Dynamic Init     Journaling FS, NVMe
 ```
 
 ---
 
-## Completed Milestone: v1.0 (Microkernel Core & Ring 3 Virtio Proof)
+## Implemented Milestones
 
-- [x] **Rust Microkernel Architecture**: Kernel entry, GDT/IDT setup, page table management, and `syscall`/`sysret` boundary.
-- [x] **Capability Enforcement Engine**: `CSpace` node management, CPtr lookup, typed memory capabilities (`Untyped`, `Frame`, `CNode`).
-- [x] **Ring 3 Virtio-Blk Storage Driver**: Unprivileged storage driver communicating exclusively via capabilities.
-- [x] **Scoped PCI I/O Isolation**: `IOPort` capability bitmask restricting driver port access strictly to device BARs.
-- [x] **Hardware Interrupt Delivery**: Device IRQ routing via `InterruptEndpoint` capabilities.
-- [x] **Preemptive Scheduler**: Hardware IRQ0 timer-driven preemptive task scheduling and idle task handle.
-- [x] **Contiguous DMA Memory Allocator**: Physical frame provision for hardware DMA memory.
-- [x] **UEFI Verified Bootloader Stub**: UEFI handover, kernel verification, and initial RAM filesystem preparation.
+### v0.1.0 / v1.0.0 (Microkernel Core & Capability Foundations)
+- [x] **Rust Microkernel Architecture**: Higher-half ELF64 kernel (`x86_64-unknown-none`), GDT/TSS/IDT setup, W^X page tables, and `syscall`/`iretq` boundary.
+- [x] **Capability Enforcement Engine**: 128-slot `CNode`s, CDT iterative revocation, generation-tagged `CPtr`s, and typed capabilities (`Untyped`, `Endpoint`, `CNode`, `Frame`, `MmioFrame`, `IOPort`, `Irq`).
+- [x] **Dynamic User Address Spaces**: Isolated per-task PML4 hierarchies, higher-half direct map, and pre-validated `copy_from_user` / `copy_to_user`.
+- [x] **Preemptive Scheduler**: 1000 Hz PIT IRQ0 round-robin scheduling with Ring 0 idle task fallback.
+- [x] **Contiguous DMA Allocator**: Physical frame allocator supporting contiguous multi-page DMA allocations.
+- [x] **UEFI Bootloader Stub**: `x86_64-unknown-uefi` loader (`SimpleFileSystem`, W^X ELF mapping, mock kernel signature check).
 
----
-
-## Phase 2: v2.0 (Dynamic Capability Delegation & Fault Recovery)
-
-- [ ] **Dynamic Capability Delegation Tree**: Implement static manifest parsing in `init` process (`INIT-POLICY.md`) to dynamically partition root capabilities to services.
-- [ ] **Independent Driver Restartability**: Detect crashed Ring 3 driver tasks, reclaim capabilities, re-initialize device queues, and restart service without restarting the microkernel.
-- [ ] **Asynchronous Event Notifications**: Non-blocking capability event queues alongside synchronous IPC.
-- [ ] **Iterative Capability Revocation Hardening**: Deep derivation tree testing and memory frame cleanup validation under stress conditions.
+### v1.1 & v1.1.1 (Usable System Services, Persistence & Hardening)
+- [x] **Asynchronous Notifications**: 64-object static notification pool with 64-bit coalescing event bitmasks (`SYS_NOTIFY_CREATE`, `SIGNAL`, `WAIT`, `POLL`).
+- [x] **Hardware IRQ Routing & Lifecycle Cleanup**: Dual 8259 PIC (vectors 32–47), spurious IRQ7/IRQ15 handling, single-EOI masking + `SYS_IRQ_ACK` (`CapType::Irq` + `CapRights::WRITE`), and automatic unbind/unmask on last-owner CSpace destruction.
+- [x] **Capability-Gated System Services**: `CapType::Console` and `CapType::Storage` enforcement on syscalls 24–30, backed by negative-test coverage in `ipc::tests`.
+- [x] **Legacy VirtIO-Blk & Persistent JanusFS**: In-kernel legacy VirtIO 0.9.5 PCI driver (`0x1AF4:0x1001`, I/O BAR0, queue `<= 256`, synchronous polling) and JanusFS sector persistence across QEMU reboots with transactional allocation/write-error rollback.
+- [x] **Interactive Ring 3 Shell**: `Task A` shell supporting `help`, `ps`/`status`, `ls`, `cat`, `write`, `rm`, `time`, `echo`, `test`, `clear`, and `exit`.
+- [x] **UART & PS/2 Input**: 16550 COM1 serial (115200 baud, FIFO) and PS/2 Set 1 scancode translation.
 
 ---
 
-## Phase 3: v3.0 (WASM Execution Engine & System Services)
-
-- [ ] **Ahead-Of-Time (AOT) WASM Compilation**: Transition from WebAssembly interpreter (`wasmi`) to AOT compiled WebAssembly execution modules.
-- [ ] **Capability-Scoped WASM Syscall Bridge**: Expose explicit capability handles (`CPtr`) to sandboxed WASM applications.
-- [ ] **Virtual File System (VFS) Service**: Isolated Ring 3 VFS process handling file capabilities, mount points, and storage IPC.
-- [ ] **Userland Console & Interactive Shell**: Ring 3 terminal driver and interactive command-line interface.
+## Partially Implemented / Deferred Within v1.x
+- **Userspace Driver Isolation**: `IOPort` and `Irq` capabilities exist, but in V1.1.1 the active VirtIO-Blk driver and JanusFS execute in Ring 0 rather than as isolated Ring 3 services.
+- **Bootloader Signature Verification**: Bootloader currently performs a placeholder `[MOCK PASS]` check rather than cryptographic verification.
+- **Complete Ambient-Authority Elimination**: Diagnostic syscalls (`SYS_GET_TIME=23`, `SYS_TASK_STATUS=32`, `SYS_LOG=8`, `SYS_SLEEP=19`) remain un-gated by capabilities.
 
 ---
 
-## Phase 4: v4.0 (SMP Multi-Core & Hardware Expansion)
+## Planned: v2.x (Userspace Services, Dynamic Init & Driver Recovery)
+- [ ] **Manifest-Based `init` Service**: Implement static manifest parsing (`docs/INIT-POLICY.md`) to replace hardcoded bootstrap CNode setup.
+- [ ] **Ring 3 VirtIO-Blk & VFS Service**: Move VirtIO-Blk and filesystem services out of Ring 0 into isolated Ring 3 tasks using async IRQ11 completion.
+- [ ] **Independent Driver Restartability**: Re-bind hardware IRQs and restart crashed Ring 3 drivers without rebooting the kernel.
+- [ ] **Crash-Consistent Filesystem**: Add journaling or copy-on-write for power-loss atomicity and lift the 2,560-byte max file size limit.
 
-- [ ] **x2APIC Migration & Multi-Core (SMP)**: Inter-Processor Interrupts (IPI), per-core runqueues, and lock-free kernel capability table sync.
-- [ ] **ARM64 / AArch64 Target Support**: Port bootloader and microkernel page table management to ARM64 architecture.
-- [ ] **Measured Boot & TPM Integration**: TPM-backed measured boot and full disk encryption keys.
+---
+
+## Deferred / Long-Term: v3.x+ (WASM, SMP & Hardware Expansion)
+- [ ] **WASM Application Runtime**: Sandboxed Ahead-Of-Time (AOT) WebAssembly execution with capability-scoped host bindings.
+- [ ] **x2APIC & Multi-Core (SMP)**: Per-CPU `swapgs` syscall stacks, IPIs, per-core runqueues, and synchronized capability/notification locking.
+- [ ] **Modern VirtIO 1.x / NVMe & Cryptographic Verified Boot**: Modern PCI capability-list VirtIO, NVMe, and real cryptographic signature / TPM measured boot.
+- [ ] **ARM64 / AArch64 Target Support**: Port bootloader and kernel paging to ARM64.
